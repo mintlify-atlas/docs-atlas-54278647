@@ -8,17 +8,17 @@ Every channel folder ships a set of standalone analysis scripts under `assets/`.
 
 ## Scripts at a glance
 
-| Script | What it does | When to use it |
-|---|---|---|
-| `read-posts.mjs` | Reads recent channel posts using `scrapePage`, optionally by ID list or page offset | First thing when onboarding any new channel; whenever a `validate.mjs` test post ID has gone stale |
-| `download-photos.mjs` | Downloads post images as JPEG files named `photo_<id>.tmp.jpg` | Before writing any vision prompt rules — never describe image content from imagination |
-| `validate.mjs` | Regression suite: runs mandatory post IDs through the exact LLM pipeline; exit code 1 on any FAIL | After every change to `prompt.mustache` or the LLM schema; before committing a new channel |
-| `read-cache.mjs` | Lists all LLM cache buckets with record counts; dumps non-null model verdicts with reasoning | After a backtest run to verify parsing quality across the whole month |
-| `event-study.mjs` | Directional price moves at +15m/+1h/+4h/+12h/+24h after each signal, and pre-post drift | After accumulating `measure-items` and `candle-items`, to locate where the edge lives |
+| Script | Channel | What it does | When to use it |
+|---|---|---|---|
+| `read-posts.mjs` | both | Reads recent channel posts using `scrapePage`, optionally by ID list or page offset | First thing when onboarding any new channel; whenever a `validate.mjs` test post ID has gone stale |
+| `download-photos.mjs` | `vershinin_trader` only | Downloads post images as JPEG files named `photo_<id>.tmp.jpg` | Before writing any vision prompt rules — never describe image content from imagination |
+| `validate.mjs` | both | Regression suite: runs mandatory post IDs through the exact LLM pipeline; exit code 1 on any FAIL | After every change to `prompt.mustache` or the LLM schema; before committing a new channel |
+| `read-cache.mjs` | `crypto_yoda_channel` only | Lists all LLM cache buckets with record counts; dumps non-null model verdicts with reasoning | After a backtest run to verify parsing quality across the whole month |
+| `event-study.mjs` | `crypto_yoda_channel` only | Directional price moves at +15m/+1h/+4h/+12h/+24h after each signal, and pre-post drift | After accumulating `measure-items` and `candle-items`, to locate where the edge lives |
 
 ## How to run each script
 
-All scripts require that you `cd` into the channel folder first — `telegram-reader` looks for `session.txt` in the current working directory, and missing it silently fails.
+Scripts that read from Telegram (`read-posts.mjs`, `download-photos.mjs`, `validate.mjs`) must be run from the channel folder — `telegram-reader` looks for `session.txt` in the current working directory. Scripts that only query MongoDB (`read-cache.mjs`, `event-study.mjs`) can be run from any folder in the project.
 
 ### read-posts.mjs
 
@@ -72,11 +72,13 @@ Exit code is 0 on all PASS, 1 on any FAIL. Each test line prints `PASS` or `FAIL
 ### read-cache.mjs
 
 ```bash
+# Run from the project root (only needs MongoDB — no session.txt required)
+
 # List all buckets and their record counts
-node assets/read-cache.mjs
+node content/crypto_yoda_channel/assets/read-cache.mjs
 
 # Dump all non-null verdicts for a specific bucket
-node assets/read-cache.mjs crypto_yoda_entry_v3_5m_0
+node content/crypto_yoda_channel/assets/read-cache.mjs crypto_yoda_entry_v3_5m_0
 ```
 
 The bucket name follows the pattern `<cache_name>_<interval>_0`, e.g. `crypto_yoda_entry_v3_5m_0`. Run without arguments first to see what buckets exist after a backtest.
@@ -84,8 +86,8 @@ The bucket name follows the pattern `<cache_name>_<interval>_0`, e.g. `crypto_yo
 ### event-study.mjs
 
 ```bash
-# Run from any folder in the project (only needs MongoDB)
-node assets/event-study.mjs crypto_yoda_entry_v3_5m_0
+# Run from the project root (only needs MongoDB — no session.txt required)
+node content/crypto_yoda_channel/assets/event-study.mjs crypto_yoda_entry_v3_5m_0
 ```
 
 Requires `measure-items` populated by a backtest run and `candle-items` populated by a `--cache` warmup. If a candle is missing for a signal timestamp, the script prints a note to pull more candle data.

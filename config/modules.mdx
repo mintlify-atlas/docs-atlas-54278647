@@ -167,7 +167,7 @@ interface ExchangeSchema {
 | `--cache` | Pre-warms `candle-items` from exchange; must be combined with `--backtest`. |
 | `--paper` | Runs `Live.background` per symbol using `paper.module.ts`; no frame needed. |
 | `--live` | Runs `Live.background` per symbol using your `live.module.ts`; no frame needed. |
-| `--ui` | Enables the backtest-kit terminal UI during replay. |
+| `--ui` | Enables the backtest-kit terminal UI during replay. Not parsed by `loader.config.ts` — passed through to backtest-kit via `strict: false` / `allowPositionals: true`. |
 
 ## Loader sequence
 
@@ -202,11 +202,13 @@ Dump.useMarkdown();         // write dump files as Markdown-wrapped JSONL
 Markdown.useDummy();        // suppress in-process Markdown rendering
 Log.useJsonl();             // write Log.* calls to dump/log/log.jsonl
 
-SessionLive.usePersist();   StorageBacktest.useMemory();
-StorageLive.usePersist();   StorageBacktest.useMemory();
-RecentLive.usePersist();    RecentBacktest.useMemory();
-MemoryLive.usePersist();    MemoryBacktest.useLocal();
-StateLive.usePersist();     StateBacktest.useLocal();
+// Live: persist to MongoDB; Backtest: in-memory or local file
+SessionLive.usePersist();     SessionBacktest.useLocal();
+StorageLive.usePersist();     StorageBacktest.useMemory();
+RecentLive.usePersist();      RecentBacktest.useMemory();
+NotificationLive.usePersist(); NotificationBacktest.useMemory();
+MemoryLive.usePersist();      MemoryBacktest.useLocal();
+StateLive.usePersist();       StateBacktest.useLocal();
 ```
 
 `Log.useJsonl()` is the most important setting for analysis: it routes all `Log.info` / `Log.debug` calls to `dump/log/log.jsonl`, which is where threshold-tuning data lives. `Markdown.useDummy()` prevents the kit from trying to render Markdown during a headless run.

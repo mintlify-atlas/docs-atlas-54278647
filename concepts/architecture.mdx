@@ -1,5 +1,5 @@
 ---
-title: "System architecture of Backtest Ollama Casual"
+title: "Backtest Ollama Casual: Three-Layer System Architecture"
 sidebarTitle: "Architecture"
 description: "Three-layer pipeline: Telegram scraping, LLM parsing via json-inference, and OHLCV replay in backtest-kit — each layer composable and replaceable."
 ---
@@ -186,5 +186,5 @@ Each context runs its own tick loop, scrapes the same channel, filters for its o
 </CardGroup>
 
 <Note>
-  `live.module.ts` is intentionally absent from this repository. Real-money execution requires exchange API keys and order-routing logic that belongs in your own private project. Copy-paste your existing live module and verify that `exchangeName` matches `"ccxt-exchange"`, candle format is `{ timestamp, open, high, low, close, volume }`, and `formatPrice`/`formatQuantity` return strings.
+  `modules/live.module.ts` is included in this repository as a starting template. It registers the same `ccxt-exchange` schema as the paper module (no frame, no aggregated trades). To use it for real-money execution, add your exchange API keys and order-routing logic, and verify that `exchangeName` matches `"ccxt-exchange"`, candle format is `{ timestamp, open, high, low, close, volume }`, and `formatPrice`/`formatQuantity` return strings.
 </Note>

@@ -1,7 +1,7 @@
 ---
-title: "Prompt regression testing with validate.mjs"
+title: "Prompt regression testing with validate.mjs scripts"
 sidebarTitle: "Prompt Validation"
-description: "Run and extend the prompt regression suite to catch silent regressions in LLM parsing before they reach production."
+description: "Run and extend the validate.mjs regression suite to catch silent LLM parsing regressions: wrong verdicts, last-post anchoring, and broken vision paths."
 ---
 
 The LLM prompt is the most fragile part of any channel strategy. A single word change in `prompt.mustache` can shift how the model handles edge-case posts — result reports that should produce `wait`, multi-post windows where the signal post isn't last, vision posts where color means profit not direction. `validate.mjs` is the defence against those regressions: it runs the strategy's exact pipeline on a fixed set of real post IDs, checks every field of the model's output against known-correct expectations, and exits with code 1 if anything fails.

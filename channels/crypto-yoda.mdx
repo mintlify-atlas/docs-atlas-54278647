@@ -1,7 +1,7 @@
 ---
 title: "Crypto Yoda channel: range + targets + stop strategy"
 sidebarTitle: "Crypto Yoda"
-description: "Parse range + five-target + stop posts with Ollama, enter within 15 minutes, and trail with an adaptive level-ratchet that replaces the author's −4% EV plan."
+description: "Parse range + five-target + stop posts with Ollama, enter within 15 minutes, and trail with an adaptive level-ratchet replacing the author's −4% EV plan."
 ---
 
 The `crypto_yoda_channel` strategy is the reference implementation of the classic signal format: each post gives an entry range, five take-profit targets, and a hard stop. The LLM extracts that structure into a typed schema, the engine enters at market within 15 minutes of publication, and a level-ratchet trailer turns each crossed target into a trailing floor — replacing the author's own plan, which event-study showed has an expected value of roughly −3.5 to −4 % per trade unleveraged.
@@ -12,7 +12,7 @@ The author publishes two distinct post types. The strategy must recognise both.
 
 ### Signal post — creates an entry
 
-```
+```text
 СИГНАЛ #BTC/USDT
 
 📛 Риск сигнала: 6/10
@@ -34,7 +34,7 @@ The LLM extracts: position direction (`ЛОНГ` → `long`), entry range `from=
 
 ### Result post — filtered out, no entry
 
-```
+```text
 #PENGU/USDT
 Тейк-профит 1 ✅
 Тейк-профит 2 ✅
