@@ -1,0 +1,164 @@
+---
+title: "Event studies: finding where the edge lives in signal channels"
+sidebarTitle: "Event Study"
+description: "Measure directional price moves at fixed horizons after each signal post, compare pre-post drift, and locate the actual edge — or lack of one."
+---
+
+An event study answers a question that signal channel marketing never asks: at which time horizon does a signal channel's directional call actually beat a coin flip? The method is simple — compute the directed price move at fixed intervals after each post, compare it against the drift before the post, and read the table. The shipping script `content/crypto_yoda_channel/assets/event-study.mjs` does this in under 100 lines against data already in MongoDB.
+
+## What the event study measures
+
+For each signal in the `measure-items` collection, the script looks up the 1-minute candle at the tick timestamp and at five future horizons: +15 minutes, +1 hour, +4 hours, +12 hours, and +24 hours. For each horizon it computes a **directed move** — the percentage change scaled to +1 for a hit and −1 for a miss:
+
+```javascript
+// Directed move in signal direction:
+// forward: ((p1 - p0) / p0) * 100 * (dir === "long" ? 1 : -1)
+// backward (pre-drift): ((p0 - p1) / p1) * 100 * (dir === "long" ? 1 : -1)
+const move = sign > 0 ? ((p1 - p0) / p0) * 100 : ((p0 - p1) / p1) * 100;
+const directional = move * (s.dir === "long" ? 1 : -1);
+```
+
+The same formula is applied in both directions: forward in time gives the post-publication drift, backward gives the **pre-drift** — how much price had already moved in the signal direction before the post appeared. Together they answer two different questions.
+
+## Why pre-drift matters
+
+Pre-drift distinguishes two fundamentally different sources of alpha:
+
+<CardGroup cols={2}>
+  <Card title="Pre-drift ≈ 50% hit rate" icon="shuffle">
+    Price had not moved in the signal direction before the post. The author's information **appears at post time** — the signal is genuinely informative rather than a trend echo.
+  </Card>
+  <Card title="Pre-drift >> 50% hit rate" icon="arrow-trend-up">
+    Price had already moved significantly in the signal direction before the post was published. The author is posting into an existing move — **momentum echo**, not new information.
+  </Card>
+</CardGroup>
+
+For crypto_yoda, the pre-drift at all horizons is 7–9 hits out of 18 — a coin flip. The signal direction is not simply echoing recent price action; the information content is real.
+
+## Data sources
+
+The event study reads from two MongoDB collections written by the backtest engine:
+
+- **`measure-items`** — the persisted LLM cache. Each document has a `bucket` field (`"crypto_yoda_entry_v3_5m_0"`), an `entryKey` (`"BTCUSDT_1722470400000"`), and a `payload.data.entry` object with `position`, `id`, and other parsed fields. These are the signals.
+- **`candle-items`** — 1-minute OHLCV pre-warmed by `--cache`. Each document has `symbol`, `interval: "1m"`, `timestamp` (ms), and `close`. These are the prices.
+
+The script queries for signals with a non-wait `position`, then fetches prices at each horizon with a `findOne` on `{ symbol, interval: "1m", timestamp: ts }`.
+
+## The event-study.mjs script
+
+The full script from `content/crypto_yoda_channel/assets/event-study.mjs`, showing both the per-signal table and the summary statistics:
+
+```javascript
+import mongoose from "mongoose";
+
+const [bucket] = process.argv.slice(2);
+
+const conn = await mongoose.createConnection("mongodb://localhost:27017/backtest-kit").asPromise();
+const db = conn.getClient().db("backtest-kit");
+const measures = db.collection("measure-items");
+const candles  = db.collection("candle-items");
+
+// Load signals from LLM cache
+const docs = await measures
+  .find({ bucket, "payload.data.entry.position": { $in: ["long", "short"] } })
+  .toArray();
+const signals = docs.map((d) => ({
+  symbol: d.entryKey.split("_")[0],
+  ts:     parseInt(d.entryKey.split("_")[1]),
+  dir:    d.payload.data.entry.position,
+  post:   d.payload.data.entry.id,
+}));
+
+// Price lookup from candle-items
+const price = async (symbol, ts) =>
+  (await candles.findOne({ symbol, interval: "1m", timestamp: ts }))?.close ?? null;
+
+const HORIZONS = [15, 60, 240, 720, 1440]; // minutes
+const stats = {};
+
+for (const s of signals) {
+  const p0 = await price(s.symbol, s.ts);
+  if (!p0) { console.log(`${s.symbol}#${s.post}: no candle at tick`); continue; }
+
+  const row = [];
+  for (const sign of [1, -1]) {       // 1 = forward, -1 = backward (pre-drift)
+    for (const h of HORIZONS) {
+      const p1 = await price(s.symbol, s.ts + sign * h * 60_000);
+      if (p1 === null) { row.push("-"); continue; }
+      const move = sign > 0 ? ((p1 - p0) / p0) * 100 : ((p0 - p1) / p1) * 100;
+      const directional = move * (s.dir === "long" ? 1 : -1);
+      row.push(directional.toFixed(2));
+      const key = sign * h;
+      (stats[key] ??= []).push(directional);
+    }
+  }
+}
+
+// Summary: mean, median, hit-rate per horizon
+for (const h of [...HORIZONS, ...HORIZONS.map((x) => -x)]) {
+  const v = stats[h];
+  if (!v?.length) continue;
+  const mean   = v.reduce((a, b) => a + b, 0) / v.length;
+  const med    = v.slice().sort((a, b) => a - b)[Math.floor(v.length / 2)];
+  const hit    = v.filter((x) => x > 0).length;
+  const label  = h > 0 ? `+${h}m after` : `${-h}m BEFORE post`;
+  console.log(`${label}: mean=${mean.toFixed(3)}%  median=${med.toFixed(3)}%  hit=${hit}/${v.length}`);
+}
+```
+
+Run it with the bucket name from `assets/read-cache.mjs`:
+
+```bash
+node assets/event-study.mjs crypto_yoda_entry_v3_5m_0
+```
+
+## Reading the output: key finding from crypto_yoda
+
+The edge at which horizon the signal channel is actually predictive shows up as both hit-rate and mean moving in the same direction with increasing horizon. For crypto_yoda over one month of August 2026:
+
+| Horizon | Hit rate | Mean directed move |
+|---|---|---|
+| +15 minutes | slightly negative | ≈ −0.1% |
+| +1 hour | slightly negative | ≈ −0.1% |
+| +4 hours | improving | ≈ +0.3% |
+| +12 hours | 12/18 | ≈ +0.9% |
+| **+24 hours** | **13/18 (72%)** | **+1.42%** |
+| Pre-drift −24h | 7–9/18 | ≈ coin flip |
+
+The 24-hour horizon is where both metrics peak and the pre-drift remains at coin-flip level. The interpretation: the directional call is not trend-echo, and the edge lives at 12–24 hours — not in the seller's first 15–60 minutes where their advertised TP1 sits.
+
+<Note>
+  One month, 16–18 events per claim. These are hypothesis-grade numbers, not proof. Hit-rate and mean on 18 events can be dominated by two or three outliers. The correct response is to extend the frame to 4–6 months (update `addFrameSchema`, re-run `--cache`, re-run the backtest) and treat the current numbers as a prior for walk-forward validation.
+</Note>
+
+## Zone analysis: the entry range as a wall of limit orders
+
+The crypto_yoda signal format includes an `entryRange` with `from` and `to` prices. This range is not just metadata — it represents a wall of subscriber limit orders placed at the same prices. The zone behavior turns out to be bimodal:
+
+- **Holds cleanly**: the zone acts as support/resistance, price bounces from it with a breach of ≤ 0.8%. These cases confirm the zone premise.
+- **Knifed through**: price blows past the entire zone by **6.8–7.7%** — straight through the stop level that every subscriber placed at the same price. These are the stop-hunt events.
+
+The two strongest signals of the month (+11.2% and +6.6% at 24h) never revisited the zone after publication. A "price must return to zone" entry gate — intuitively reasonable — would silently discard the best trades of the month.
+
+<Tip>
+  Zone analysis is not included in `event-study.mjs` but can be built from the same two collections. For each signal: fetch candles from publication time onward, find the minimum (for longs) or maximum (for shorts) price in the first N candles, and compute the breach depth relative to the `entryRange` boundaries.
+</Tip>
+
+## From event study to walk-forward validation
+
+The event study locates the hypothesis. Walk-forward validation tests whether it holds out-of-sample. `backtest-kit` ships `Sweep` (parameter grid search) and `Walker` (rolling-window optimization + test) for this purpose. The recommended workflow:
+
+<Steps>
+  <Step title="Identify the horizon">
+    Run the event study. Note which horizon shows the clearest edge in both hit-rate and mean.
+  </Step>
+  <Step title="Design the exit rule">
+    Structure the exit around the identified horizon — a time-based exit, a trailing stop calibrated to the horizon's volatility, or the level-ratchet from crypto_yoda. Structural rules beat magic numbers.
+  </Step>
+  <Step title="Extend the frame">
+    Update `addFrameSchema` in `modules/backtest.module.ts` to cover 4–6 months. Re-run `--cache` to pre-warm the additional candles.
+  </Step>
+  <Step title="Walk-forward">
+    Use `Sweep` to grid-search parameters on the first half of the extended frame, then `Walker` to validate on rolling windows. A constant that only looks good on August is a constant fitted to August.
+  </Step>
+</Steps>

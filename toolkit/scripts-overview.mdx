@@ -1,0 +1,110 @@
+---
+title: "Forensics scripts: read, validate, and study signal data"
+sidebarTitle: "Scripts Overview"
+description: "Every channel ships standalone debug scripts in assets/ that run against live Telegram and MongoDB data — no extra setup required."
+---
+
+Every channel folder ships a set of standalone analysis scripts under `assets/`. These scripts are not test fixtures or mocked integrations — they run against live Telegram sessions and real MongoDB data, making them the fastest way to answer operational questions: what did the author post, what did the model return, where does the edge live? They require no special configuration beyond being run from the correct working directory.
+
+## Scripts at a glance
+
+| Script | What it does | When to use it |
+|---|---|---|
+| `read-posts.mjs` | Reads recent channel posts using `scrapePage`, optionally by ID list or page offset | First thing when onboarding any new channel; whenever a `validate.mjs` test post ID has gone stale |
+| `download-photos.mjs` | Downloads post images as JPEG files named `photo_<id>.tmp.jpg` | Before writing any vision prompt rules — never describe image content from imagination |
+| `validate.mjs` | Regression suite: runs mandatory post IDs through the exact LLM pipeline; exit code 1 on any FAIL | After every change to `prompt.mustache` or the LLM schema; before committing a new channel |
+| `read-cache.mjs` | Lists all LLM cache buckets with record counts; dumps non-null model verdicts with reasoning | After a backtest run to verify parsing quality across the whole month |
+| `event-study.mjs` | Directional price moves at +15m/+1h/+4h/+12h/+24h after each signal, and pre-post drift | After accumulating `measure-items` and `candle-items`, to locate where the edge lives |
+
+## How to run each script
+
+All scripts require that you `cd` into the channel folder first — `telegram-reader` looks for `session.txt` in the current working directory, and missing it silently fails.
+
+### read-posts.mjs
+
+Supports three calling modes based on the arguments passed:
+
+```bash
+# Run from: content/crypto_yoda_channel/ or content/vershinin_trader/
+
+# Last 40 posts (default)
+node assets/read-posts.mjs
+
+# Last 100 posts
+node assets/read-posts.mjs 100
+
+# Next page — limit 40, offset 40
+node assets/read-posts.mjs 40 40
+
+# Specific posts by ID (any argument > 1000 is treated as a post ID)
+node assets/read-posts.mjs 5890 5776 5885
+```
+
+Filter out telegram-reader client noise:
+
+```bash
+node assets/read-posts.mjs | grep -v "resize begin"
+```
+
+### download-photos.mjs
+
+```bash
+# Run from: content/vershinin_trader/
+
+# Specific post IDs
+node assets/download-photos.mjs 3573 3572 3558
+
+# All photos from the most recent 40 posts
+node assets/download-photos.mjs
+```
+
+Photos are saved as `photo_<id>.tmp.jpg` in the current directory. Open them with an image viewer before writing prompt rules for image content. Delete them when done — the `.tmp.jpg` suffix is the convention for throwaway files.
+
+### validate.mjs
+
+```bash
+# Run from the channel folder (needs session.txt and prompt.mustache)
+node assets/validate.mjs
+```
+
+Exit code is 0 on all PASS, 1 on any FAIL. Each test line prints `PASS` or `FAIL` with the post IDs used, the model's verdict, and what was expected. On failure, the full model response is printed for inspection.
+
+### read-cache.mjs
+
+```bash
+# List all buckets and their record counts
+node assets/read-cache.mjs
+
+# Dump all non-null verdicts for a specific bucket
+node assets/read-cache.mjs crypto_yoda_entry_v3_5m_0
+```
+
+The bucket name follows the pattern `<cache_name>_<interval>_0`, e.g. `crypto_yoda_entry_v3_5m_0`. Run without arguments first to see what buckets exist after a backtest.
+
+### event-study.mjs
+
+```bash
+# Run from any folder in the project (only needs MongoDB)
+node assets/event-study.mjs crypto_yoda_entry_v3_5m_0
+```
+
+Requires `measure-items` populated by a backtest run and `candle-items` populated by a `--cache` warmup. If a candle is missing for a signal timestamp, the script prints a note to pull more candle data.
+
+## Naming convention for temporary scripts
+
+Inline debug scripts you write during a session should be named `*.tmp.mjs` and deleted immediately after use. This keeps the `assets/` folder clean and distinguishes durable tools from one-off experiments. Long scripts with complex quoting should be put in a temp file rather than run as `node -e '...'` — shell quoting mangles apostrophes in non-ASCII text.
+
+<CardGroup cols={2}>
+  <Card title="MongoDB Queries" icon="database" href="/toolkit/mongodb-queries">
+    Query measure-items and candle-items directly for cache inspection and event study analysis.
+  </Card>
+  <Card title="Prompt Validation" icon="circle-check" href="/toolkit/prompt-validation">
+    Understand the validate.mjs regression suite and how to extend it for new channels.
+  </Card>
+  <Card title="Thresholds" icon="sliders" href="/toolkit/thresholds">
+    Principled approach to deriving constants from process distributions, not PnL.
+  </Card>
+  <Card title="Adding a Channel" icon="plus" href="/channels/adding-a-channel">
+    Step-by-step playbook for onboarding a new Telegram signal channel.
+  </Card>
+</CardGroup>

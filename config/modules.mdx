@@ -1,0 +1,216 @@
+---
+title: "Exchange and run-mode modules: backtest, paper, and live"
+sidebarTitle: "Modules"
+description: "How backtest.module.ts, paper.module.ts, and live.module.ts register exchange schemas and how CLI flags select the active run mode."
+---
+
+The project separates exchange connectivity from run logic through a module system. Each file in `modules/` calls `addExchangeSchema` (and, for backtest, `addFrameSchema`) to register itself. The loader then picks up the first registered schema and routes every symbol to the correct background worker. Swapping from backtest to paper trading is as simple as loading a different module file — no other code changes.
+
+## How module registration works
+
+`addExchangeSchema` registers a named exchange implementation. `loader.config.ts` calls `listExchangeSchema()` and takes the first result:
+
+```typescript
+// config/loader.config.ts
+const [exchangeSchema] = await listExchangeSchema();
+
+if (!exchangeSchema) {
+  throw new Error("Exchange not specified");
+}
+```
+
+Because only one exchange module should be loaded per run, a single `import` of the right module at the entry point is all that is needed to configure the runtime.
+
+## backtest.module.ts
+
+`backtest.module.ts` is the module for `--backtest` and `--cache` runs. It registers a public-only ccxt Binance spot client under the name `"ccxt-exchange"`, and it also calls `addFrameSchema` to define the replay window.
+
+```typescript
+// modules/backtest.module.ts
+addExchangeSchema({
+  exchangeName: "ccxt-exchange",
+  getCandles: async (symbol, interval, since, limit) => {
+    const exchange = await getExchange();
+    const candles = await exchange.fetchOHLCV(
+      symbol,
+      interval,
+      since.getTime(),
+      limit,
+    );
+    return candles.map(([timestamp, open, high, low, close, volume]) => ({
+      timestamp,
+      open,
+      high,
+      low,
+      close,
+      volume,
+    }));
+  },
+  getOrderBook: async (symbol, depth, _from, _to, backtest) => {
+    if (backtest) {
+      throw new Error(
+        "Order book fetching is not supported in backtest mode for the default exchange schema. Please implement it according to your needs.",
+      );
+    }
+    // ... live order book fetch
+  },
+  getAggregatedTrades: async (symbol: string, from: Date, to: Date) => {
+    const exchange = await getExchange();
+    const response = await exchange.publicGetAggTrades({
+      symbol,
+      startTime: from.getTime(),
+      endTime: to.getTime(),
+    });
+    return response.map((t: any) => ({
+      id: String(t.a),
+      price: parseFloat(t.p),
+      qty: parseFloat(t.q),
+      timestamp: t.T,
+      isBuyerMaker: t.m,
+    }));
+  },
+  formatPrice: async (symbol, price) => { /* ... */ },
+  formatQuantity: async (symbol, quantity) => { /* ... */ },
+});
+
+addFrameSchema({
+  frameName: "aug_2026_frame",
+  interval: "1m",
+  startDate: new Date("2026-08-01T00:00:00Z"),
+  endDate: new Date("2026-08-31T23:59:59Z"),
+  note: "August 2026",
+});
+```
+
+Key points for `backtest.module.ts`:
+
+- No API keys — the ccxt client uses only public endpoints.
+- `getOrderBook` throws when `backtest === true`; the framework never calls it during replay.
+- `getAggregatedTrades` calls Binance's `publicGetAggTrades` — used by the strategy's event study helpers.
+- `addFrameSchema` is present here and nowhere else; omitting `--cache`/`--backtest` flags while this module is loaded will produce a "Frame not specified" error.
+
+## paper.module.ts
+
+`paper.module.ts` is the module for paper trading (the `--paper` flag). It registers the same `"ccxt-exchange"` name with the same public ccxt Binance client, but without `getAggregatedTrades` and without `addFrameSchema`:
+
+```typescript
+// modules/paper.module.ts
+addExchangeSchema({
+  exchangeName: "ccxt-exchange",
+  getCandles: async (symbol, interval, since, limit) => { /* same as backtest */ },
+  getOrderBook: async (symbol, depth, _from, _to, backtest) => { /* same guard */ },
+  formatPrice: async (symbol, price) => { /* same rounding */ },
+  formatQuantity: async (symbol, quantity) => { /* same rounding */ },
+});
+```
+
+Paper mode fires the same `Live.background` path as live mode — the only difference is which exchange module is loaded.
+
+## live.module.ts
+
+`live.module.ts` is intentionally **not shipped** with real order execution. The file in the repository is a copy of `paper.module.ts` that uses the same public read-only client. Before using `--live`, replace its contents with your own exchange implementation that carries real API keys and calls actual order endpoints. When writing your own implementation:
+
+- Keep `exchangeName` as `"ccxt-exchange"` to avoid a "Exchange not specified" conflict with the loader.
+- Return `{ timestamp, open, high, low, close, volume }` objects from `getCandles`.
+- Return strings (not numbers) from `formatPrice` and `formatQuantity`.
+
+<Warning>
+  The repository ships `live.module.ts` as a read-only public stub. Connecting it to real funds — adding API keys, wiring `createOrder` / `cancelOrder` calls — is entirely the operator's responsibility. Test thoroughly with `--paper` before enabling `--live`.
+</Warning>
+
+## Exchange schema interface
+
+Every exchange module must implement the full schema interface:
+
+```typescript
+interface ExchangeSchema {
+  exchangeName: string;
+
+  // Returns OHLCV candles; in backtest mode these are served from candle-items cache
+  getCandles(
+    symbol: string,
+    interval: string,
+    since: Date,
+    limit: number
+  ): Promise<Array<{ timestamp: number; open: number; high: number; low: number; close: number; volume: number }>>;
+
+  // Returns order book depth; must throw when backtest === true
+  getOrderBook(
+    symbol: string,
+    depth: number,
+    from: Date,
+    to: Date,
+    backtest: boolean
+  ): Promise<{ symbol: string; asks: Array<{ price: string; quantity: string }>; bids: Array<{ price: string; quantity: string }> }>;
+
+  // Optional: aggregated trade tape (backtest.module.ts only)
+  getAggregatedTrades?(
+    symbol: string,
+    from: Date,
+    to: Date
+  ): Promise<Array<{ id: string; price: number; qty: number; timestamp: number; isBuyerMaker: boolean }>>;
+
+  // Format price to exchange tick size — returns a string
+  formatPrice(symbol: string, price: number): Promise<string>;
+
+  // Format quantity to exchange step size — returns a string
+  formatQuantity(symbol: string, quantity: number): Promise<string>;
+}
+```
+
+## CLI flags
+
+| Flag | Effect |
+|---|---|
+| `--entry <file>` | **Required.** Path to the strategy file to load. Without it the loader exits immediately. |
+| `--backtest` | Runs `Backtest.background` per symbol; requires a frame schema to be registered. |
+| `--cache` | Pre-warms `candle-items` from exchange; must be combined with `--backtest`. |
+| `--paper` | Runs `Live.background` per symbol using `paper.module.ts`; no frame needed. |
+| `--live` | Runs `Live.background` per symbol using your `live.module.ts`; no frame needed. |
+| `--ui` | Enables the backtest-kit terminal UI during replay. |
+
+## Loader sequence
+
+When `--entry` is present the loader executes in this order:
+
+<Steps>
+  <Step title="Wait for MongoDB">
+    `waitForInit()` blocks until the `@backtest-kit/mongo` connection is ready.
+  </Step>
+  <Step title="Wait for backtest-kit ready">
+    `waitForReady(isBacktest)` initialises the engine in the correct mode.
+  </Step>
+  <Step title="Resolve schemas">
+    `listStrategySchema()`, `listExchangeSchema()`, and (if backtest) `listFrameSchema()` each take the first registered entry. Missing schemas throw immediately.
+  </Step>
+  <Step title="Pre-warm candles (if --cache)">
+    Downloads 1m OHLCV for every symbol across the frame window into `candle-items`.
+  </Step>
+  <Step title="Spawn per-symbol backgrounds">
+    Iterates `SYMBOL_LIST` and calls `Backtest.background` or `Live.background` for each symbol.
+  </Step>
+</Steps>
+
+## setup.config.ts — output format controls
+
+`config/setup.config.ts` configures the runtime persistence backends and output formats for both live and backtest modes:
+
+```typescript
+// config/setup.config.ts (selected lines)
+Dump.useMarkdown();         // write dump files as Markdown-wrapped JSONL
+
+Markdown.useDummy();        // suppress in-process Markdown rendering
+Log.useJsonl();             // write Log.* calls to dump/log/log.jsonl
+
+SessionLive.usePersist();   StorageBacktest.useMemory();
+StorageLive.usePersist();   StorageBacktest.useMemory();
+RecentLive.usePersist();    RecentBacktest.useMemory();
+MemoryLive.usePersist();    MemoryBacktest.useLocal();
+StateLive.usePersist();     StateBacktest.useLocal();
+```
+
+`Log.useJsonl()` is the most important setting for analysis: it routes all `Log.info` / `Log.debug` calls to `dump/log/log.jsonl`, which is where threshold-tuning data lives. `Markdown.useDummy()` prevents the kit from trying to render Markdown during a headless run.
+
+<Warning>
+  Both `--live` and `--paper` invoke `Live.background` — the code path inside `loader.config.ts` is identical for the two flags. The only thing that distinguishes a paper run from a live run is which exchange module is imported in the strategy entry file. Always verify that the correct module is loaded before starting a run.
+</Warning>

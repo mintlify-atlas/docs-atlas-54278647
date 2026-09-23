@@ -1,0 +1,282 @@
+---
+title: "Add a new Telegram signal channel to Backtest Ollama Casual"
+sidebarTitle: "Adding a Channel"
+description: "Ten-step playbook for onboarding a new Telegram signal channel: read posts, design the LLM schema, run regression, and ship a 5m production strategy."
+---
+
+Every channel has its own guidance format — not only "range + 5 targets + stop". An author may post one target, targets in percentages, only a direction, a grid of averaging entries, or signals purely through chart screenshots. The schema, prompt, entry rules, and position management must all be derived from the author's actual posts. Nothing is invented from the outside. This playbook gives the universal process steps; the two shipped channels (`crypto_yoda_channel` and `vershinin_trader`) are worked examples of opposite extremes.
+
+<Steps>
+
+### Create the channel folder
+
+Create `content/<channel_name>/` with the following files:
+
+```
+content/<channel_name>/
+  main.strategy.ts     # production: Cache interval 5m, post freshness ≤15 min
+  main.test.ts         # 4h test variant + snippets library (copy from a neighbour)
+  prompt.mustache      # LLM prompt (or prompt_open.mustache + prompt_close.mustache for dual-pipeline)
+  session.txt          # MTProto session — copy from a neighbour channel folder
+  README.md            # strategy description and post format documentation
+  assets/              # per-channel debug scripts (see below)
+  dump/                # backtest reports (created on first run)
+```
+
+The `assets/` folder should contain the following scripts (copy headers from `crypto_yoda_channel` or `vershinin_trader`, change the channel name):
+
+| Script | Purpose |
+|---|---|
+| `read-posts.mjs` | Read last N posts / paginate / fetch by id |
+| `download-photos.mjs` | Download post photos as JPEG — inspect before writing any vision rules |
+| `validate.mjs` | Regression suite: required cases on the live model, exit code 1 on failure |
+| `read-cache.mjs` | Inspect `measure-items` bucket — list non-null model verdicts |
+| `event-study.mjs` | Directional price move at +15m/+1h/+4h/+12h/+24h after each signal |
+
+`main.test.ts` is a **snippets library**, not just a test. It contains everything cut from production for space — per-signal `State`, breakeven logic (`commitBreakeven` + `BREAKEVEN_STATE`), `Log.info/debug` telemetry for threshold calibration. Copy it from a neighbour; don't write from scratch.
+
+<Note>
+`session.txt` holds the MTProto userbot session. It is shared across channels — if the file already exists in a neighbour folder, copy it. If this is a fresh machine, run `node -e 'require("telegram-reader").signIn()'` from inside `content/<channel_name>/` and scan the QR code in Telegram → Settings → Devices → Link Desktop Device.
+</Note>
+
+### Read posts with telegram-reader
+
+Before writing any code, read real posts to understand what the author actually publishes. Run from `content/<channel_name>/` (telegram-reader looks for `session.txt` in the current directory):
+
+```javascript
+import { scrapePage } from "telegram-reader";
+
+const messages = await scrapePage({
+  channel: "<channel_name>",  // or numeric id string for private channels
+  limit: 50,
+  offset: 0,
+  when: new Date("2027-01-01T00:00:00Z"),
+});
+
+for (const m of messages) {
+  console.log(`=== id=${m.id} date=${m.date.toISOString()}`);
+  console.log(m.content.slice(0, 400));
+}
+```
+
+Answer these questions before moving on:
+
+- **Entry format**: point entry, range (from–to), percentage move, or image-only?
+- **Targets**: how many? In prices or percentages?
+- **Stop-loss**: included in posts, or absent?
+- **Ticker format**: `#BTC`, `#BTC/USDT`, or bare `BTC` with no tag?
+- **Non-signal types**: result reports, ads, analytics without a ticker — what do they look like?
+- **Channel type**: public username or private numeric id?
+
+The answers to these questions determine the entire schema, prompt, and entry logic. Nothing else does.
+
+<CardGroup cols={2}>
+  <Card title="Private channel" icon="lock">
+    Use the numeric id as `CHANNEL_NAME` (e.g. `"-1002833393903"`). Post links must be built as `https://t.me/c/${channel.slice(4)}/${id}` — not `https://t.me/${channel}/${id}`.
+  </Card>
+  <Card title="No ticker tag" icon="tag">
+    If tickers appear without `#` (e.g. bare `BTC`, `1000PEPE`), pre-LLM filtering is impossible. The model must receive all posts in the window, and the prompt must require it to scan every message.
+  </Card>
+</CardGroup>
+
+### Download and inspect images
+
+If the channel posts chart images, position cards, or screenshots, download them **before** writing any vision rules:
+
+```bash
+node assets/download-photos.mjs
+```
+
+Open the downloaded JPEGs and look at them. Answer:
+
+- What type of images are posted? (TradingView chart with TP/SL zones? Exchange position card? Screenshot of a positions panel?)
+- Where is the direction written? (As a word? By the position of a coloured zone relative to entry?)
+- What could be misread? (P&L colour is profit/loss, **not** direction — a profitable short shows green.)
+
+<Warning>
+Never write vision rules from imagination. If you describe "there's an arrow pointing up or down" without looking at actual images from this specific channel, the rules will be wrong and the prompt will silently misclassify direction. Download first; write second.
+</Warning>
+
+### Design the LLM schema
+
+Design a `FormatModel` object (`json-inference`) that matches what the channel actually provides. The `TradingPositionFormat` from `crypto_yoda_channel` is one example for "range + 5 targets + stop"; it is not a universal template.
+
+Universal rules for every `FormatModel`:
+
+- The format is flat: `{ type: "object", required: [...], properties: {...} }`.
+- Arrays must include `items: { type: "number" }` — without it, the model mixes number and string elements.
+- Nested objects are supported (e.g. `entryRange: { from, to }`).
+- There are no defaults in the schema itself. Use `description` fields to say "return -1 if absent", "return [] if absent", "return wait if no signal".
+- Every schema needs: an "absent" exit (`position: "wait"`), the source post `id`, and `reasoning` for debugging. Remaining fields come from what the channel provides.
+- Use `enum` only on string fields.
+
+**Choose a pipeline architecture based on channel format:**
+
+| Channel format | Architecture |
+|---|---|
+| Post contains all signal info (range, targets, stop) | Single pipeline: `getSignal` in `addStrategySchema` |
+| Author posts entry and exit as separate messages at different times | Dual pipeline: `listenIdlePing` + `commitCreateSignal` for open; `listenActivePing` + `commitClosePending` for close |
+
+For dual-pipeline channels, use `addStrategySchema({ strategyName })` **without** a `getSignal` function. `commitCreateSignal` in `listenIdlePing` queues a signal that the next tick consumes.
+
+### Write `prompt.mustache`
+
+Structure the prompt as:
+
+1. **Role declaration**: "I am auditing trading recommendations from channel X."
+2. **Output instruction**: return only entries for ticker `{{symbol}}`.
+3. **Filter rule for multi-post windows**: if you are sending multiple posts per LLM call, include an explicit instruction — "scan ALL messages; return wait only if NONE of them contain an entry for `{{symbol}}`". Without this, models anchor on the last message in the batch and miss earlier signals.
+4. **Real post examples**: copy actual signal posts from the channel verbatim — one example per signal type.
+5. **Non-signal examples**: copy actual non-signal posts and label them explicitly as "do NOT return an entry for these".
+
+If the channel has no ticker tag (bare tickers), the prompt must say: "Tickers are written without `#` or a pair: `BTC` means `BTCUSDT`, `1000PEPE` means `1000PEPEUSDT`."
+
+### Debug inline
+
+Validate the prompt on real posts before running any backtest. Write a temporary inline script that reproduces the exact strategy pipeline:
+
+```javascript
+import { generateObject, InferenceName } from "json-inference";
+import { scrapeLookback } from "telegram-reader";
+import Mustache from "mustache";
+import { str } from "functools-kit";
+import { readFile } from "fs/promises";
+
+const symbol = "BTCUSDT";
+const when = new Date("2025-03-15T12:00:00Z");
+
+const messages = await scrapeLookback({
+  channel: "<channel_name>",
+  limit: 15,
+  dimension: "minute",
+  when,
+});
+
+const template = await readFile("./prompt.mustache", "utf-8");
+const prompt = Mustache.render(template, { symbol });
+
+const result = await generateObject(
+  InferenceName.OllamaInference,
+  {
+    format: YourFormatModel,
+    messages: [
+      { role: "user", content: prompt },
+      ...messages.map(({ id, channel, date, content }) => ({
+        role: "user",
+        content: str.newline(
+          `ID ${id}`,
+          "",
+          content,
+          "",
+          `[${date.toISOString()}]: https://t.me/${channel}/${id}`,
+        ),
+      })),
+    ],
+  },
+  "gemma4:31b-cloud",
+);
+
+console.log(JSON.stringify(result, null, 2));
+```
+
+**Do not simplify the pipeline.** Use the exact same message format, prompt rendering, and schema that the strategy will use. Bugs often live in message assembly, not in the prompt text itself.
+
+Test every signal type and every non-signal type before proceeding.
+
+### Run `validate.mjs` regression
+
+`assets/validate.mjs` is the mandatory regression suite. Add one test case for every signal type and every non-signal type in the channel. The suite must exit with code 1 on any failure.
+
+Example structure:
+
+```javascript
+const cases = [
+  {
+    description: "long entry post for BTCUSDT",
+    postId: 1234,          // real post id from the channel
+    symbol: "BTCUSDT",
+    expect: { position: "long" },
+  },
+  {
+    description: "result report post — should be filtered",
+    postId: 1235,
+    symbol: "BTCUSDT",
+    expect: { position: "wait" },
+  },
+  // ... one case per post type
+];
+```
+
+After any prompt or schema change, run:
+
+```bash
+node assets/validate.mjs
+```
+
+Cases are tied to post ids. If old posts scroll out of the scrape window, update the ids via `assets/read-posts.mjs`.
+
+### Build a test strategy (4h interval)
+
+Copy `main.test.ts` from a neighbour channel and swap `CHANNEL_NAME` and the schema. The test strategy uses a 4h Cache interval and a 4h scrape window, which makes the LLM call on a different schedule than production.
+
+Run the backtest for at least a full month:
+
+```bash
+npm start -- --backtest --ui --entry ./content/<channel_name>/main.test.ts --cache
+```
+
+The test strategy will not be profitable — it enters hours late. That is not its purpose. Its purpose is to call the LLM across a full month of posts, populate `measure-items` in MongoDB, and surface parsing errors before you invest time in production logic.
+
+### Inspect MongoDB
+
+After the test run, verify that the model is parsing correctly:
+
+```javascript
+// All non-null model responses — check directions, prices, symbol normalisation
+const docs = await db.collection("measure-items")
+  .find({
+    bucket: "<channel_name>_entry_v1_4h_0",
+    "payload.data.entry.position": { $in: ["long", "short"] },
+  })
+  .toArray();
+```
+
+Check:
+- Are positions (`long`/`short`) correct?
+- Are prices numeric and in the right order of magnitude?
+- Is `symbol` normalised to `*USDT` format?
+- Are there any `GET_SIGNAL_FN thrown` errors in the logs? (Fix those before production.)
+
+### Build the production strategy (5m interval)
+
+Create `main.strategy.ts` from the tested logic:
+
+1. **New cache name**: start at `<channel_name>_entry_v1`; bump to `v2`, `v3`, etc. on every schema or post-selection change.
+2. Set `Cache.file` interval to `"5m"`.
+3. Set the scrape window to `FRESH_WINDOW_MINUTES = 15` with `dimension: "minute"`.
+4. Add the staleness gate in `getSignal` (or in `listenIdlePing`):
+
+```typescript
+if (
+  when.getTime() - new Date(message.date).getTime() >
+  FRESH_WINDOW_MINUTES * 60_000
+) {
+  return null;
+}
+```
+
+5. Design entry and position management from the channel's format — not from crypto_yoda's rules.
+
+For quick-reference, common patterns by channel type:
+
+| Channel characteristic | Recommended pattern |
+|---|---|
+| Single entry post with targets and stop | `getSignal` in `addStrategySchema`; TP on farthest target; SL from post; level-ratchet trailing |
+| Author-led exits ("I'm closing") | Dual pipeline; `listenIdlePing` + `commitCreateSignal` + `Position.moonbag`; own hard stop |
+| No ticker tag | Skip pre-LLM filter; "scan ALL messages" in prompt |
+
+</Steps>
+
+<Warning>
+**The staleness gate must use `new Date(message.date)`, not the raw `message.date` string.** `Cache.file` persists responses as JSON. When a response is read back from MongoDB, `message.date` is a plain string — not a `Date` object. Calling `.getTime()` on a string returns `NaN`, which means the comparison `when.getTime() - NaN` is always `NaN`, the gate never fires, and the strategy enters on arbitrarily old posts. Wrap it: `new Date(message.date).getTime()`.
+</Warning>

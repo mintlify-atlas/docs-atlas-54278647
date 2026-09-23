@@ -1,0 +1,190 @@
+---
+title: "System architecture of Backtest Ollama Casual"
+sidebarTitle: "Architecture"
+description: "Three-layer pipeline: Telegram scraping, LLM parsing via json-inference, and OHLCV replay in backtest-kit — each layer composable and replaceable."
+---
+
+The project is a measurement rig. It takes a Telegram signal channel, replays a month of its posts against 1-minute candles, and asks the question nobody in the paid-signals industry wants asked: where does the edge actually live, and does it survive the seller's own money management? Three layers do the work — a Telegram scraper, an LLM parser, and a backtest execution engine — wired together so that every step is reproducible from stored data in MongoDB.
+
+## Three layers
+
+<CardGroup cols={3}>
+  <Card title="Telegram scraping" icon="paper-plane">
+    `telegram-reader` provides `scrapeLookback` (window back from `when`), `scrapePage` (paginated), and `scrapeDay` (calendar day). All I/O flows through a MTProto userbot session stored in `session.txt`.
+  </Card>
+  <Card title="LLM parsing" icon="brain">
+    `json-inference` wraps Ollama's `gemma4:31b-cloud` via tool-grammar structured output. `generateObject` and `generateText` parse signal posts — text and chart screenshots — into validated TypeScript DTOs.
+  </Card>
+  <Card title="Execution / measurement" icon="chart-line">
+    `backtest-kit` replays 1-minute OHLCV candles. Each tick fires the strategy, opens/manages/closes positions, and writes lifecycle events to `dump/report/backtest.jsonl`. Candles and LLM cache land in MongoDB.
+  </Card>
+</CardGroup>
+
+## Data flow
+
+<Steps>
+  <Step title="scrapeLookback">
+    On each backtest tick, `scrapeLookback` is called with the tick's `when` timestamp. Only posts published **before** that moment are visible — there is no look-ahead.
+  </Step>
+  <Step title="Post filter">
+    Messages are filtered by coin tag (`#BTC`, `#PENGU`, etc.) before reaching the LLM. Channels without tags (like vershinin_trader) pass the full window and rely on the prompt to filter.
+  </Step>
+  <Step title="generateObject (tool-grammar)">
+    The filtered messages, rendered prompt, and `FormatModel` schema are passed to `generateObject` from `json-inference`. The tool-grammar forces the model to return a valid, schema-conforming object.
+  </Step>
+  <Step title="Validated signal DTO">
+    The returned object — `entry.position`, `entry.targets`, `entry.stoploss`, etc. — is validated. If the position is `wait` or the message is stale, `null` is returned and no trade is entered.
+  </Step>
+  <Step title="Backtest engine tick → OHLCV replay">
+    `backtest-kit` consumes the signal DTO. On subsequent per-minute ticks `listenActivePing` fires, tracks level crossings, applies the ratchet, and emits `opened` / `active` / `closed` events.
+  </Step>
+  <Step title="MongoDB persistence">
+    LLM call results land in the `measure-items` collection (keyed by `SYMBOL_timestamp`). Candle data lives in `candle-items`. Both collections feed the analytics scripts in `content/*/assets/`.
+  </Step>
+</Steps>
+
+## Strategy registration
+
+Every strategy file registers three schemas before the backtest loader runs:
+
+```typescript
+// Registers the strategy with its getSignal callback (or empty for event-driven)
+addStrategySchema({ strategyName: "main_strategy", getSignal: ... });
+
+// Registered in modules/backtest.module.ts — Binance spot via ccxt, no API keys
+addExchangeSchema({ exchangeName: "ccxt-exchange", getCandles: ..., formatPrice: ... });
+
+// Registered in modules/backtest.module.ts — defines the replay window
+addFrameSchema({
+  frameName: "aug_2026_frame",
+  interval: "1m",
+  startDate: new Date("2026-08-01T00:00:00Z"),
+  endDate: new Date("2026-08-31T23:59:59Z"),
+  note: "August 2026",
+});
+```
+
+The loader in `config/loader.config.ts` picks the **first** registered schema from each list. Exactly one exchange module should be loaded per run.
+
+## Two entry modes
+
+The two shipped channels illustrate opposite entry patterns:
+
+<Tabs>
+  <Tab title="getSignal — classic (crypto_yoda)">
+    The strategy provides a `getSignal` callback in `addStrategySchema`. The framework calls it on every tick. When it returns a non-null DTO the engine opens a position immediately.
+
+    ```typescript
+    addStrategySchema({
+      strategyName: "main_strategy",
+      getSignal: async (symbol, when) => {
+        const { entry, message, url } = await getSignal(symbol, when);
+        if (!entry || entry.position === "wait") return null;
+        // freshness gate, target selection, ...
+        return {
+          id: `${entry.id}-${entry.symbol.toLowerCase()}`,
+          symbol: entry.symbol,
+          position: entry.position,
+          priceStopLoss: entry.stoploss,
+          priceTakeProfit,
+          minuteEstimatedTime: Infinity,
+          payload: { levels: entry.targets },
+          note: JSON.stringify(info, null, 2),
+        };
+      },
+    });
+    ```
+
+    Works well when every signal post carries a complete set of levels (range, targets, stop).
+  </Tab>
+  <Tab title="listenIdlePing + commitCreateSignal — event-driven (vershinin)">
+    The strategy registers an empty schema and commits signals imperatively from a listener.
+
+    ```typescript
+    addStrategySchema({ strategyName: "main_strategy" });
+
+    listenIdlePing(async ({ symbol, when, currentPrice }) => {
+      const { signal, message, url } = await getOpenSignal(symbol, when);
+      if (!signal || (signal.position !== "long" && signal.position !== "short")) return;
+      await commitCreateSignal(symbol, {
+        id: `${signal.id}-${signal.symbol.toLowerCase()}`,
+        symbol: signal.symbol,
+        ...Position.moonbag({
+          position: signal.position,
+          currentPrice,
+          percentStopLoss: HARD_STOP_PERCENT,
+        }),
+        note: JSON.stringify({ signal, message: omit(message, "photo"), url }, null, 2),
+      });
+    });
+    ```
+
+    Fires every minute while no position is open. A second pipeline (`listenActivePing` + `commitClosePending`) handles closes when the author announces them in a separate post.
+  </Tab>
+</Tabs>
+
+## Cache layer
+
+Every LLM call is wrapped in `Cache.file` to prevent hammering Telegram and Ollama on every 1-minute tick during backtest replay.
+
+```typescript
+const getSignal = Cache.file(
+  async (symbol: string, when: Date) => {
+    // ... scrapeLookback + generateObject
+  },
+  {
+    interval: "5m",   // crypto_yoda: fast entry, cache refreshes every 5 minutes
+    name: "crypto_yoda_entry_v3",
+  },
+);
+```
+
+The cache key is `SYMBOL_timestamp` (milliseconds of the tick). Results are persisted to the `measure-items` MongoDB collection and read back on replay without re-calling the model. The vershinin strategy uses `"4h"` intervals because its author posts infrequently.
+
+<Warning>
+  The cache `name` **must** change whenever the `FormatModel` schema or post-selection logic changes. Stale cache entries use the old schema and will silently mix old and new parsed results.
+</Warning>
+
+## Per-symbol parallelism
+
+`SYMBOL_LIST` is declared in `config/loader.config.ts` and assigned to `globalThis`:
+
+```typescript
+const SYMBOL_LIST = [
+  "BTCUSDT", "POLUSDT", "ZECUSDT", "HYPEUSDT", "DOGEUSDT",
+  "SOLUSDT", "PENGUUSDT", "TRXUSDT", "HBARUSDT", "NEARUSDT",
+  "FARTCOINUSDT", "ETHUSDT", "PUMPUSDT",
+];
+Object.assign(globalThis, { SYMBOL_LIST });
+```
+
+The loader then spawns an independent `Backtest.background` context for each symbol:
+
+```typescript
+for (const symbol of SYMBOL_LIST) {
+  if (values.backtest) {
+    Backtest.background(symbol, {
+      exchangeName: exchangeSchema.exchangeName,
+      strategyName: strategySchema.strategyName,
+      frameName: frameSchema.frameName,
+    });
+  }
+}
+```
+
+Each context runs its own tick loop, scrapes the same channel, filters for its own coin tag, and maintains its own position lifecycle. The LLM cache key includes the symbol, so BTCUSDT and PENGUUSDT never share a cached response.
+
+## The `modules/` pattern
+
+<CardGroup cols={2}>
+  <Card title="modules/backtest.module.ts" icon="database">
+    Registers `ccxt-exchange` (Binance spot, public endpoints, no API keys) and `aug_2026_frame`. Also registers `getAggregatedTrades` via Binance's `publicGetAggTrades` — not present in the paper module. Import this for `--backtest` runs.
+  </Card>
+  <Card title="modules/paper.module.ts" icon="file">
+    Registers the same `ccxt-exchange` schema without frame or aggregated trades. Import this for `--paper` runs. Both modules are interchangeable because the loader picks the first registered schema by name.
+  </Card>
+</CardGroup>
+
+<Note>
+  `live.module.ts` is intentionally absent from this repository. Real-money execution requires exchange API keys and order-routing logic that belongs in your own private project. Copy-paste your existing live module and verify that `exchangeName` matches `"ccxt-exchange"`, candle format is `{ timestamp, open, high, low, close, volume }`, and `formatPrice`/`formatQuantity` return strings.
+</Note>

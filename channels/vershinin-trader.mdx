@@ -1,0 +1,194 @@
+---
+title: "Vershinin Trader channel: vision-enabled dual-pipeline strategy"
+sidebarTitle: "Vershinin Trader"
+description: "Two independent LLM pipelines for a private channel with no ranges or stops: open on 'I'm in' posts (with screenshots), close on 'I'm out' posts."
+---
+
+The Vershinin Trader strategy is the reference implementation for the hardest channel format to parse: no entry ranges, no target grid, no stops in posts. The author enters "at current levels", announces trades through chart images and exchange position-panel screenshots, and closes them in a separate plain-text post days later. Because entry and exit are completely independent events, the strategy runs **two independent LLM pipelines** — one watching for opens on idle ticks, one watching for closes on active ticks — with a fixed 7.5% hard stop substituted for the stops the author never publishes.
+
+## Channel format
+
+### Private channel
+
+The channel is private. Its numeric id `-1002833393903` is used as `CHANNEL_NAME`; post links are built as `https://t.me/c/${channel.slice(4)}/${id}` (stripping the `-100` prefix that telegram-reader returns).
+
+### Entry posts (`position = long | short`)
+
+```
+Работаю с ETH — в лонг с текущих значений, моя точка входа 2750$, цель ожидаю 2825$, стоп поставил 2715$, плечо 100х
+```
+
+```
+Еще и 1000PEPE беру так же в лонг с текущих, на 3-4% вверх!
+```
+
+```
+Работаю с SOL — в шорт
+(+ BYDFi share card: «SOLUSDT Бессрочный, Шорт | 50x»)
+```
+
+```
+🤑ETH — можно рассмотреть кто без сделки.
+(+ TradingView chart: green TP zone above entry = long)
+```
+
+Tickers are written without a pair and without `#`: `BTC`, `ETH`, `1000PEPE`, `VIRTUAL` → `BTCUSDT`, `ETHUSDT`, `1000PEPEUSDT`, `VIRTUALUSDT`. The author's leverage (50x–100x) is ignored by the strategy.
+
+### Close posts (`action = close`)
+
+```
+❗️МОИ ШОРТЫ НА BYBIT ПРИНИМАЮ РЕШЕНИЕ ЗАКРЫТЬ, ПРИНЯТЬ УБЫТКИ И ДВИГАТЬСЯ ДАЛЬШЕ!
+```
+
+The close pipeline also triggers on "close all positions at once" announcements like the one above — not only per-symbol closes.
+
+### Non-signal posts (`wait / hold`)
+
+- Partial fixation and position management: "50% фиксанул, остальное в б/у", "стоп передвинул на 2705$"
+- Analytics and expectations: "хочу увидеть снятие 5.3$", market analyses, "Мысли по BTC нужны?"
+- News, VIP-channel ads, `#реклама`, "пишите @alex_vershin"
+- Posts with no text and no photo (usually a continuation album frame from the previous post)
+
+## Two LLM pipelines
+
+### Open pipeline — finding entries
+
+`getOpenSignal` is wrapped in `Cache.file` (bucket `vershinin_trader_open_v2`, interval `4h`). On each idle tick the `listenIdlePing` handler calls it:
+
+```typescript
+listenIdlePing(async ({ symbol, when, currentPrice }) => {
+  const { signal, message, url } = await getOpenSignal(symbol, when);
+  if (!signal) {
+    return;
+  }
+  if (signal.position !== "long" && signal.position !== "short") {
+    return;
+  }
+  Log.info(
+    "vershinin trade",
+    `${symbol}: открываю ${signal.position} от цены ${currentPrice} по посту ${signal.id}, хард-стоп ${HARD_STOP_PERCENT}%`
+  );
+  await commitCreateSignal(symbol, {
+    id: `${signal.id}-${signal.symbol.toLowerCase()}`,
+    symbol: signal.symbol,
+    ...Position.moonbag({
+      position: signal.position,
+      currentPrice,
+      percentStopLoss: HARD_STOP_PERCENT,
+    }),
+    note: JSON.stringify(
+      { signal, message: omit(message, "photo"), url },
+      null,
+      2
+    ),
+  });
+});
+```
+
+`Position.moonbag` sets a market entry, a hard stop at `HARD_STOP_PERCENT` below (long) or above (short) the current price, and a far-away take-profit (effectively "hold until closed or stopped"). The author's own stated TP targets and stops from posts are not used — there are none in the schema.
+
+Inside the cache, `getOpenSignal`:
+
+1. Scrapes the last `WINDOW_MINUTES` (240) minutes of posts.
+2. Keeps only posts that have text **or** a photo (purely empty frames are discarded).
+3. Sends **all** remaining posts to `generateObject` with `PositionOpenFormat`. There is no pre-LLM ticker filter — tickers in this channel are bare words without `#`, making substring matching unreliable. The prompt instead requires the model to scan every message.
+4. If the returned `id` is not in the scraped window, the signal is discarded and logged.
+
+**Schema — `PositionOpenFormat`:**
+
+| Field | Type | Default when absent | Description |
+|---|---|---|---|
+| `id` | `number` | `-1` | Source post id |
+| `symbol` | `string` | — | Ticker normalised to `*USDT` |
+| `position` | `"long" \| "short" \| "wait"` | `"wait"` | Direction; `wait` = no entry found |
+| `reasoning` | `string` | — | Model explanation for debugging |
+
+### Close pipeline — author-driven exits
+
+`getCloseSignal` is symmetric (`Cache.file`, bucket `vershinin_trader_close_v2`, interval `4h`). On each active-position tick `listenActivePing` calls it; if the model returns `action: "close"`, the position is closed via `commitClosePending`.
+
+**Schema — `PositionCloseFormat`:**
+
+| Field | Type | Default when absent | Description |
+|---|---|---|---|
+| `id` | `number` | `-1` | Source post id |
+| `symbol` | `string` | — | Ticker normalised to `*USDT` |
+| `action` | `"hold" \| "close"` | `"hold"` | `close` only when the author exits this symbol or all positions |
+| `reasoning` | `string` | — | Model explanation for debugging |
+
+Partial fixation ("50% фиксанул"), stop moves, breakevens, and analytics all map to `hold` — the position is untouched.
+
+## Vision: images as part of the signal
+
+Because tickers and directions are often visible only in attached screenshots, every post that has a photo passes the image to the model via the `images` field:
+
+```typescript
+messages.map(({ id, channel, date, content, photo }) => ({
+  role: "user" as const,
+  content: str.newline(
+    `ID ${id}`,
+    "",
+    content,
+    "",
+    `[${date.toISOString()}]: https://t.me/c/${channel.slice(4)}/${id}`,
+  ),
+  ...(photo && { images: [photo] }),
+}))
+```
+
+`photo` is a base64 JPEG preview (~800 px wide) provided by telegram-reader's `ScraperMessage`. Three image types were identified by actually downloading and inspecting real posts with `assets/download-photos.mjs`:
+
+<CardGroup cols={3}>
+  <Card title="TradingView position-tool chart" icon="chart-candlestick">
+    Green rectangle = TP zone, red = SL zone. **Green zone above entry = long; below = short.** Ticker in the chart header (e.g. "BTCUSDT Perpetual Contract").
+  </Card>
+  <Card title="BYDFi share card" icon="credit-card">
+    Ticker and direction written as plain text on the card: "SOLUSDT Бессрочный, Шорт | 50x". Card styling varies (light/dark, referral code visible), but ticker + Лонг/Шорт are always present.
+  </Card>
+  <Card title="Exchange position panel" icon="table-columns">
+    Screenshot of a live position: "BTCUSDT, Шорт | Кросс 100x", entry price, P&L number.
+  </Card>
+</CardGroup>
+
+<Warning>
+**Green P&L ≠ long direction.** A short position in profit shows a green number. Both prompts explicitly state: determine direction only from the word Лонг/Шорт on the image, or from the position of the TP/SL zones on a TradingView chart. Never use P&L colour as a direction signal.
+</Warning>
+
+## Hard stop
+
+The author publishes no stop-loss levels. A fixed `HARD_STOP_PERCENT = 7.5` is applied by `Position.moonbag` at entry time. The `Position.moonbag` helper returns `{ position, priceTakeProfit, priceStopLoss }` with the TP set far away (effectively unlimited) and the SL set at the specified percentage from the current price.
+
+## Log topics
+
+| Topic | What is recorded |
+|---|---|
+| `vershinin open` | Window empty / N posts sent (M with photos) / model verdict with reasoning / id not in window (discarded) |
+| `vershinin close` | Same for the close pipeline |
+| `vershinin trade` | Actual actions: "opening short from price X via post Y", "closing position via post Z" |
+
+Logs are written only on real LLM calls (not cache hits) — at most once every four hours per symbol.
+
+## Key constants
+
+| Constant | Value | Purpose |
+|---|---|---|
+| `CHANNEL_NAME` | `"-1002833393903"` | Numeric id of the private channel |
+| `WINDOW_MINUTES` | `240` | Scrape window (4 h, test/production mode) |
+| `HARD_STOP_PERCENT` | `7.5` | Own hard stop from entry price — author publishes none |
+| Open cache name | `vershinin_trader_open_v2` | Bump on any schema or prompt change |
+| Close cache name | `vershinin_trader_close_v2` | Bump on any schema or prompt change |
+| `Cache.file` interval | `4h` | LLM check frequency per symbol |
+
+## Run commands
+
+```bash
+# backtest
+npm start -- --backtest --ui --entry ./content/vershinin_trader/main.strategy.ts
+
+# same, pre-warming 1m candles into MongoDB
+npm start -- --backtest --ui --entry ./content/vershinin_trader/main.strategy.ts --cache
+```
+
+<Warning>
+**Adding or removing images from the model input requires a new cache name.** The current names (`_v2`) were chosen because vision was added at that revision. If you change the set of posts forwarded with images — or stop sending images altogether — bump both `vershinin_trader_open_v*` and `vershinin_trader_close_v*` to avoid replaying cached responses that were produced under different model input.
+</Warning>

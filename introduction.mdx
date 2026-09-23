@@ -1,0 +1,81 @@
+---
+title: "Backtest Ollama Casual: Measure Telegram Signal Channels"
+sidebarTitle: "Introduction"
+description: "A measurement rig for paid Telegram signal channels: Ollama LLM parses trader posts into structured signals and backtests them against 1-minute candles."
+---
+
+Signal channels are a murky industry everyone "knows" about and almost nobody has measured. Their public reports cherry-pick leveraged wins on partial take-profits; losses go unposted; methodology is unfalsifiable — until you replay a month of posts against minute candles with zero look-ahead bias. That is exactly what this project does, and the answers turned out to be more interesting than "scam / not scam".
+
+## What the Project Is
+
+**backtest-ollama-casual** is a measurement rig for the paid-signals industry, built on [backtest-kit](https://github.com/tripolskypetr/backtest-kit). It connects three moving parts:
+
+1. **A Telegram userbot** (via [telegram-reader](https://www.npmjs.com/package/telegram-reader)) that scrapes posts — text and chart screenshot images — from a signal channel.
+2. **An LLM parsing pipeline** that converts unstructured trader guidance into typed, structured signal objects.
+3. **A backtesting engine** that executes each signal in a realistic simulation against historical minute candles and measures what the market actually did.
+
+The result is a reproducible, data-driven answer to one question the industry avoids: *where does the edge actually live, and does it survive the seller's own money management?*
+
+## The LLM Pipeline
+
+The parser uses `gemma4:31b-cloud` through [json-inference](https://github.com/tripolskypetr/json-inference), which fixes Ollama's broken structured output for cloud models. Cloud models ignore the `format` parameter and respond with markdown fences or bare arrays — `JSON.parse` fails. json-inference solves this by passing the schema as `provide_answer` tool-call parameters: the tool grammar forces a valid object, responses are validated recursively, and mismatches are retried automatically.
+
+Each Telegram post — including any attached chart screenshot as a base64 JPEG — is fed to the model with a channel-specific `prompt.mustache` and a typed JSON schema. The output is a structured signal: entry range, targets, stop-loss, position direction, and a source post ID. Numeric fields are deterministic (copied from the post text); only the free-text `reasoning` field wanders between runs.
+
+## The Execution Engine
+
+backtest-kit replays each parsed signal against 1-minute OHLCV candles fetched from Binance. Every signal is entered within minutes of its publication timestamp (5-minute cache interval, 15-minute freshness gate), so the simulation reflects what a subscriber could realistically execute. There is no look-ahead bias: the strategy only sees candles that existed at the moment the post was published.
+
+Position management is handled by a level-ratchet trailing mechanism — each take-profit target crossed becomes a new floor, and a retrace beyond 30% of the local grid step closes the position. This slack is derived from the distribution of survived retraces in the data, not fitted to trade outcomes.
+
+## Key Findings
+
+One month of data, 16–18 events per question — hypothesis-grade, not proof. Every number is reproducible from `measure-items` + `candle-items` via the scripts shipped in `content/*/assets/`.
+
+| Finding | Detail |
+|---|---|
+| **Real micro-edge — wrong horizon** | 24 hours after a post, price moved the signalled way in 13/18 cases (72%), mean +1.42% unleveraged. In the first 15–60 minutes: slightly negative. The edge lives at 12–24h, not where the seller says. |
+| **The seller's plan is mathematically ruinous** | TP1 hit in 44%, TP2 in 19%, TP3 in 6%, TP4/TP5: never (0/16). Following the posts as written has an EV of roughly −3.5…−4% per trade unleveraged. Advertised X13–25 leverage turns a single stop into −60…−100% of margin. |
+| **Entry zone is a wall of subscriber limit orders** | The "from–to" range either holds price cleanly (breach ≤ 0.8%) or gets knifed straight through by 6.8–7.7% — past the stop level every subscriber placed at the same price. A strict price-in-zone entry gate silently discards the two strongest signals of the month (+11.2%, +6.6%). |
+| **All realized profit came from exit engineering** | Level-ratchet trailing alone: −0.31% on the month. Adding a structural breakeven rule (stop to entry after 50% progress to TP1): +3.37% — 7 ratchet wins (+7.84%), 8 breakeven zeros, one honest −4.47% stop. |
+
+<Note>
+One month, 16–18 events per claim — hypothesis-grade, not proof. Every number is reproducible from `measure-items` + `candle-items` via the shipped scripts.
+</Note>
+
+## Repo Structure
+
+The repository ships two channels with completely opposite signal formats as worked examples. Every channel lives in its own folder under `content/`, with its own schema, prompt, entry rules, and position management derived from the author's actual posts — nothing invented.
+
+```
+content/
+  crypto_yoda_channel/     # "range + 5 targets + stop" format
+  vershinin_trader/         # "I'm in / I'm out" with screenshots, two LLM pipelines
+config/
+  loader.config.ts          # CLI entry point: --entry, --backtest, --cache flags; hardcoded SYMBOL_LIST
+modules/
+  backtest.module.ts        # Registers Binance spot exchange + backtest frame schema
+  paper.module.ts           # Same exchange, no frame (live paper mode)
+docker/
+  mongo/                    # MongoDB 8 compose file
+  redis/                    # Redis 7 compose file
+```
+
+The core design lesson: **every channel has its own guidance format**. The schema, prompt, entry rules, and position management must all be derived from the author's actual posts. The two shipped channels are worked examples of opposite extremes — use them as starting points, not templates.
+
+## Explore Further
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Get MongoDB and Redis running, authorize Telegram, and run your first backtest in minutes.
+  </Card>
+  <Card title="Architecture" icon="diagram-project" href="/concepts/architecture">
+    Understand how the Telegram scraper, LLM pipeline, and backtest engine fit together.
+  </Card>
+  <Card title="Crypto Yoda Channel" icon="chart-line" href="/channels/crypto-yoda">
+    Deep dive into the "range + 5 targets + stop" format and the level-ratchet strategy.
+  </Card>
+  <Card title="Adding a Channel" icon="plus" href="/channels/adding-a-channel">
+    Step-by-step playbook for onboarding a new Telegram signal channel with its own strategy.
+  </Card>
+</CardGroup>

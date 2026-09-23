@@ -1,47 +1,183 @@
 ---
-title: "Quickstart"
-description: "Begin with a guide on the fastest path to a successful outcome"
+title: "Get Started with Backtest Ollama Casual"
+sidebarTitle: "Quickstart"
+description: "Install dependencies, start MongoDB and Redis, authorize Telegram, and run your first signal-channel backtest in under ten minutes."
 ---
 
-Describe how someone begins using your product. What is the first thing they need to do? Are there any prerequisites?
+This guide walks you through everything needed to get from a fresh clone to a completed backtest of the `crypto_yoda_channel` example strategy. The whole setup — dependencies, infrastructure, Telegram auth, and the backtest run itself — takes under ten minutes on a machine that already has Docker and Ollama installed.
 
-A quickstart should take someone from zero to using your product. They'll get a quick win and a sense of what they can accomplish.
-
-## Prerequisites
-
-Before you begin, you must have:
-
-- Requirement one (for example, Node.js 18+, a free account, an API key)
-- Requirement two (for example, a compatible device, a compatible browser, a compatible operating system)
-
-## Get started
+<Warning>
+The Telegram authorization (`signIn()`) and the backtest run (`npm start`) are interactive commands that **you must run yourself** in your terminal. They cannot be automated or run headlessly. `signIn()` opens a QR code that must be scanned in the Telegram mobile app; the backtest streams live output as it replays candles.
+</Warning>
 
 <Steps>
-  <Step title="Install">
-    Describe how to install your product or sign up.
 
-    ```bash
-    npm install your-package
-    ```
-  </Step>
-  <Step title="Configure">
-    Describe any setup or configuration needed before first use.
+<Step title="Prerequisites">
 
-    ```bash
-    your-cli init
-    ```
-  </Step>
-  <Step title="Run it">
-    Show the first thing a user does to see it working.
+Make sure the following are available on your machine before continuing:
 
-    ```bash
-    your-cli start
-    ```
-  </Step>
-</Steps>
+- **Node.js 18 or later** — the CLI and strategy files use ESM and native `parseArgs`.
+- **Docker** — used to run MongoDB and Redis locally via Docker Compose.
+- **Ollama** — running locally with the `gemma4:31b-cloud` model already pulled.
+
+To pull the model if you haven't already:
+
+```bash
+ollama pull gemma4:31b-cloud
+```
+
+Verify Ollama is running and the model is available:
+
+```bash
+ollama list
+```
+
+You should see `gemma4:31b-cloud` in the output before proceeding.
+
+</Step>
+
+<Step title="Install Dependencies">
+
+Clone the repository and install Node.js dependencies from the repo root:
+
+```bash
+npm install
+```
+
+After `npm install` completes, reinstall the `sharp` module with its optional native binary. This is a known issue: npm strips optional dependencies (including `sharp`'s platform binary) during install, causing `telegram-reader` to fail with "Could not load the sharp module":
+
+```bash
+npm install --include=optional sharp
+```
+
+</Step>
+
+<Step title="Start Infrastructure">
+
+The project requires MongoDB (for the `measure-items` LLM cache and `candle-items` OHLCV store) and Redis (for backtest-kit's internal queue). Both are provided as Docker Compose files in the `docker/` subdirectory.
+
+Start MongoDB:
+
+```bash
+cd docker/mongo
+docker compose up -d
+```
+
+Start Redis:
+
+```bash
+cd docker/redis
+docker compose up -d
+```
+
+MongoDB will be available at `mongodb://localhost:27017` and Redis at `localhost:6379` with password `mysecurepassword`. These match the defaults expected by `@backtest-kit/mongo` and the `ioredis` client used internally.
+
+Verify both containers are up:
+
+```bash
+docker ps
+```
+
+You should see `mongodb` and `redis` containers in the `Up` state.
+
+</Step>
+
+<Step title="Authorize Telegram">
+
+The project uses a Telegram userbot (via `telegram-reader`) to scrape channel posts. Authorization is a one-time interactive step that creates a `session.txt` file in the channel folder. This file is reused by all subsequent runs without re-authorization.
+
+Run the sign-in command from the channel folder so the session file is saved in the correct location:
+
+```bash
+cd content/crypto_yoda_channel
+node -e 'require("telegram-reader").signIn()'
+```
+
+A QR code will appear in your terminal. Scan it in the Telegram mobile app via **Settings → Devices → Link Desktop Device**. If you have two-factor authentication enabled, the prompt will ask for your 2FA password after the scan.
+
+Once complete, a `session.txt` file will appear in `content/crypto_yoda_channel/`. You can verify the session works by running any scraper script from that folder — it should complete without a `getTelegram failed: no session found` error.
+
+<Note>
+The `session.txt` file is shared across channels for the same Telegram account. If you later add a second channel, you can copy the existing `session.txt` into the new channel folder instead of re-authorizing.
+</Note>
+
+</Step>
+
+<Step title="Run Your First Backtest">
+
+Return to the repo root and start the backtest for the `crypto_yoda_channel` strategy:
+
+```bash
+npm start -- --backtest --ui --entry ./content/crypto_yoda_channel/main.strategy.ts
+```
+
+Flag reference:
+
+| Flag | Meaning |
+|---|---|
+| `--backtest` | Run in backtest mode (historical replay against candle data) |
+| `--ui` | Open the backtest-kit web UI in your browser for a live chart view |
+| `--entry` | Path to the strategy file to load (required; the loader exits without it) |
+
+The engine will replay each signal against 1-minute OHLCV candles across the full backtest frame defined in `modules/backtest.module.ts`. Each of the 13 symbols in `SYMBOL_LIST` (hardcoded in `config/loader.config.ts`) runs as its own `Backtest.background` context, filtering the channel's posts for its ticker.
+
+On first run, candle data is fetched on demand from Binance as the replay reaches each timestamp. Subsequent runs with the same frame reuse the cached candles from MongoDB.
+
+</Step>
+
+<Step title="Pre-warm the Candle Cache (Optional)">
+
+For faster replay on repeated runs, you can pre-download all 1-minute candles for every symbol in `SYMBOL_LIST` into MongoDB before starting the backtest:
+
+```bash
+npm start -- --backtest --ui --entry ./content/crypto_yoda_channel/main.strategy.ts --cache
+```
 
 <Tip>
-  Give people a way to get help. This could be a link to a support page, a chat with a customer support agent, or a forum for your product.
-
-  Example: Need help? Reach out to us at [support@yourcompany.com](mailto:support@yourcompany.com).
+The `--cache` flag downloads candles for the full backtest frame (all symbols, 1-minute interval) into the `candle-items` MongoDB collection before the replay begins. After pre-warming, repeated backtests and event study scripts run significantly faster because candle lookups hit the local database instead of the Binance API.
 </Tip>
+
+The `--cache` flag is only valid alongside `--backtest`. Using it with `--live` or `--paper` has no effect.
+
+</Step>
+
+<Step title="Inspect the Results">
+
+After the backtest completes, results are written to two places:
+
+**Dump files** — written to `content/crypto_yoda_channel/dump/report/` on every run:
+
+| File | Contents |
+|---|---|
+| `backtest.jsonl` | Per-tick lifecycle of every position: `opened`, `active` (price snapshots), `closed` (with `closeReason`, `pnl`, `duration`) |
+| `strategy.jsonl` | Every commit action (`breakeven`, etc.) with full position snapshot |
+| `breakeven.jsonl` | One row per stop-to-entry transfer |
+| `highest_profit.jsonl` | Peak profit reached per position |
+| `max_drawdown.jsonl` | Maximum drawdown reached per position |
+
+**MongoDB collections** — in the `backtest-kit` database at `mongodb://localhost:27017`:
+
+| Collection | Contents |
+|---|---|
+| `measure-items` | The persisted LLM cache: every parsed signal with its `bucket`, `entryKey`, and the full model response in `payload.data` |
+| `candle-items` | 1-minute OHLCV candles warmed by `--cache` or fetched on demand during replay |
+
+To quickly check what the model returned across the backtest, run from the repo root:
+
+```javascript
+// node -e (one-liner) — inspect non-null signals in the LLM cache
+const mongoose = require("mongoose");
+const conn = await mongoose.createConnection("mongodb://localhost:27017/backtest-kit").asPromise();
+const db = conn.getClient().db("backtest-kit");
+const docs = await db.collection("measure-items")
+  .find({ "payload.data.entry.position": { $in: ["long", "short"] } })
+  .toArray();
+console.log(JSON.stringify(docs.map(d => d.payload.data.entry), null, 2));
+await conn.close();
+```
+
+Each `dump/report/backtest.jsonl` row with `data.action === "closed"` contains the final `pnl`, `closeReason`, `duration`, and the original signal in `note` — everything needed to attribute each trade to its source post.
+
+</Step>
+
+</Steps>

@@ -1,0 +1,192 @@
+---
+title: "LLM as a parser: structured output from Telegram posts"
+sidebarTitle: "LLM Parsing"
+description: "How json-inference's tool-grammar forces gemma4:31b-cloud to return valid JSON from Telegram signal posts, including chart screenshots."
+---
+
+The LLM in this project is not an oracle — it is a parser. Its job is to copy numbers from a Telegram post into typed fields, identify the direction (`long` / `short` / `wait`), and leave the free-text reasoning field as a debugging aid. This sounds simple until you try calling Ollama's structured output directly: cloud models ignore the `format` parameter and answer with markdown fences or arrays, and `JSON.parse` dies. `json-inference` exists to fix that.
+
+## Why `ollama.chat` with `format` breaks
+
+Ollama's `format` parameter works reliably for small local models but fails with cloud-proxied models like `gemma4:31b-cloud`. The model returns responses like:
+
+```
+```json
+[]
+```
+```
+
+or wraps a nested object in an outer array. `JSON.parse` on either form throws immediately. This was confirmed empirically in the project by replaying the strategy's exact call on a post that produced the crash — not assumed from documentation.
+
+## How json-inference fixes it
+
+Instead of the `format` parameter, `json-inference` passes the schema as the parameter declaration of a `provide_answer` tool call. The tool-calling grammar in the model's inference pipeline forces it to emit a syntactically valid tool invocation — which means a valid JSON object. The library then validates the result recursively against your schema and retries on mismatch.
+
+<Warning>
+  Never call `ollama.chat` with `format` directly. Always use `generateObject` or `generateText` from `json-inference`. Any call that bypasses the tool-grammar will break on cloud models.
+</Warning>
+
+```typescript
+import { generateObject, InferenceName, type FormatModel } from "json-inference";
+
+const entry = await generateObject(
+  InferenceName.OllamaInference,
+  {
+    format: TradingPositionFormat,   // your FormatModel schema
+    messages: [
+      { role: "user", content: renderedPrompt },
+      ...messages.map(({ id, channel, date, content }) => ({
+        role: "user" as const,
+        content: str.newline(
+          `ID ${id}`,
+          "",
+          content,
+          "",
+          `[${date.toISOString()}]: https://t.me/${channel}/${id}`,
+        ),
+      })),
+    ],
+  },
+  "gemma4:31b-cloud",
+);
+```
+
+## FormatModel: the schema contract
+
+`FormatModel` is the type that `json-inference` accepts. The rules are tight by design:
+
+- **Flat object** at the top level: `{ type: "object", required: [...], properties: {...} }`
+- **Arrays must have `items`**: `{ type: "array", items: { type: "number" } }`. Without `items`, the model returns a mix of numbers and strings at its discretion.
+- **Nested objects are supported**: `entryRange: { type: "object", required: ["from", "to"], properties: { from: {...}, to: {...} } }`
+- **No defaults in the schema**: use the `description` field instead — e.g. `"If no signal, return -1"` or `"If no signal, return []"`.
+- **`enum` only on string fields**: valid for `position: "long" | "short" | "wait"`, not for numeric types.
+- **Always include `reasoning`**: a free-text field the model fills with its chain-of-thought, invaluable for debugging misparsed posts.
+
+## Real schema: TradingPositionFormat from crypto_yoda
+
+The complete schema used by `content/crypto_yoda_channel/main.strategy.ts` — not simplified, not abbreviated:
+
+```typescript
+const TradingPositionFormat = {
+  type: "object",
+  required: [
+    "id",
+    "symbol",
+    "position",
+    "entryRange",
+    "targets",
+    "stoploss",
+    "reasoning",
+  ],
+  properties: {
+    id: {
+      type: "number",
+      description: str.newline(
+        "ID сообщения из которого был сформирован сигнал.",
+        "Это число, пиши только его без строкового префикса ID, например, 2134.",
+        "Если сигнала нет, верни -1",
+      ),
+    },
+    symbol: {
+      type: "string",
+      description: str.newline(
+        "Тикер позиции строго в формате *USDT, Например",
+        "Текст #BTC/USDT преобразуем в BTCUSDT без # и /",
+      ),
+    },
+    position: {
+      type: "string",
+      enum: ["long", "short", "wait"],
+      description: "Тип позиции, long или short. Если позиции нет, верни wait",
+    },
+    entryRange: {
+      type: "object",
+      description: str.newline(
+        "Диапазон входа в позицию, например для 'в диапазоне $78600 - $79400'",
+        "верни from=78600, to=79400. Если сигнала нет, верни from=0 и to=0",
+      ),
+      required: ["from", "to"],
+      properties: {
+        from: { type: "number", description: "Цена входа ОТ" },
+        to:   { type: "number", description: "Цена входа ДО" },
+      },
+    },
+    targets: {
+      type: "array",
+      description: "Цели позиции, 5 уровней, числа. Если сигнала нет, верни []",
+      items: { type: "number" },
+    },
+    stoploss: {
+      type: "number",
+      description: "СТОП ЛОСС, одна точка хард стоп. Если сигнала нет, верни 0",
+    },
+    reasoning: {
+      type: "string",
+      description: str.newline(
+        "Строковое описание почему ты сделал именно такое решение",
+        "Будет использовано программистом для отладки",
+      ),
+    },
+  },
+} satisfies FormatModel;
+```
+
+The `satisfies FormatModel` check at compile time catches schema violations before a single backtest run.
+
+## Determinism: numbers yes, reasoning no
+
+Comparing two cache generations over identical inputs reveals the following pattern: every numeric field (`id`, `stoploss`, all five `targets`, `entryRange.from`, `entryRange.to`) matches bit-for-bit between runs. The `reasoning` field and its language (sometimes Russian, sometimes English) wander freely. The tool grammar pins the structure; the model copies prices from the post text reliably. This was confirmed by comparing cache v1 and v2 in MongoDB across shared `entryKey` values — it was not assumed.
+
+<Tip>
+  When debugging, always compare **every** field between runs. Declaring the model "deterministic" after checking only the numbers is a known trap: the `reasoning` field diverges in every pair.
+</Tip>
+
+## Vision: chart screenshots as model input
+
+`ScraperMessage.photo` carries a base64 JPEG preview (~50 KB, 800 px wide) for any post that contains an image. Pass it to the model via the `images` field in a message:
+
+```typescript
+...messages.map(({ id, channel, date, content, photo }) => ({
+  role: "user" as const,
+  content: str.newline(
+    `ID ${id}`,
+    "",
+    content,
+    "",
+    `[${date.toISOString()}]: https://t.me/c/${channel.slice(4)}/${id}`,
+  ),
+  ...(photo && { images: [photo] }),
+})),
+```
+
+The `images` field works in both `generateObject` and `generateText`. `gemma4:31b-cloud` reads chart images reliably. In the vershinin_trader channel, three image types were found by actually running `assets/download-photos.mjs` and examining the files:
+
+1. **TradingView position-tool charts** — direction is inferred from the position of the take-profit zone relative to the entry line (above = long, below = short).
+2. **BYDFi share cards** — direction is written as the word *Лонг* or *Шорт* on the card.
+3. **Exchange position panels** — direction also written as *Лонг/Шорт*; a green P&L number on a short means profit, not a long position.
+
+<Warning>
+  Vision prompt rules must come from actually viewing real post images with `assets/download-photos.mjs`, never from imagination. A classic mistake already made in this project: writing prompt rules about "arrows on charts" when the images contained no arrows at all — only position-tool zones and text labels. The prompt must describe what is actually there.
+</Warning>
+
+## Cache wrapping for LLM calls
+
+Every `generateObject` call lives inside `Cache.file`. Without it, `listenIdlePing` fires every minute per symbol and turns the backtest into a minute-by-minute Telegram and Ollama spam run.
+
+```typescript
+const getSignal = Cache.file(
+  async (symbol: string, when: Date) => {
+    // scrapeLookback + generateObject here
+  },
+  {
+    interval: "5m",                    // how often to re-ask the model
+    name: "crypto_yoda_entry_v3",      // cache bucket name in measure-items
+  },
+);
+```
+
+<Warning>
+  Change `name` every time the schema or post-selection logic changes. Old cache entries keyed by the same name will silently supply responses parsed under the previous schema, mixing old and new data in the same MongoDB bucket.
+</Warning>
+
+The cache key is `SYMBOL_timestamp` (ms). Entries are stored in the `measure-items` MongoDB collection under `bucket = "<name>_<interval>_0"`. The analytics scripts in `content/*/assets/` read directly from this collection — the LLM cache is the primary data source for the event study.

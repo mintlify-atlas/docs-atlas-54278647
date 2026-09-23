@@ -1,0 +1,228 @@
+---
+title: "Backtest dump files: reading and analyzing run results"
+sidebarTitle: "Dump Format"
+description: "Structure of the dump/ directory, JSONL event schemas for backtest.jsonl and log.jsonl, and how to interpret action types and close reasons."
+---
+
+Every backtest run writes its output to `content/<channel>/dump/`, which is recreated fresh on each invocation. All files use JSONL format — one JSON object per line — so they can be streamed and filtered with standard Unix tools or loaded line-by-line in analysis scripts. The most important file is `report/backtest.jsonl`, which contains the full position lifecycle; `log/log.jsonl` holds structured telemetry emitted by `Log.*` calls inside the strategy.
+
+## Directory layout
+
+```
+content/<channel>/dump/
+  report/
+    backtest.jsonl        # main lifecycle ticks (opened / active / closed / idle)
+    strategy.jsonl        # commit events — breakeven moves, partial closes, etc.
+    breakeven.jsonl       # one entry per stop-to-entry move
+    highest_profit.jsonl  # peak profit recorded per position
+    max_drawdown.jsonl    # maximum drawdown recorded per position
+    partial.jsonl         # partial close events
+    heat.jsonl            # symbol-level heatmap
+    performance.jsonl     # per-tick timing data (large; for profiling only)
+  log/
+    log.jsonl             # Log.* output when Log.useJsonl() is active
+```
+
+| File | Purpose |
+|---|---|
+| `report/backtest.jsonl` | Complete position lifecycle: idle ticks, entries, per-minute snapshots, closes |
+| `report/strategy.jsonl` | Every `commit*` action with the full position snapshot and updated levels |
+| `report/breakeven.jsonl` | One row per stop-to-entry move (`commitBreakeven`) |
+| `report/highest_profit.jsonl` | Running peak profit percentage per position |
+| `report/max_drawdown.jsonl` | Running maximum drawdown percentage per position |
+| `report/partial.jsonl` | Partial-close events (`commitPartial*`) |
+| `report/heat.jsonl` | Per-symbol aggregated heatmap data |
+| `report/performance.jsonl` | High-frequency timing measurements — large file, not useful for trade analysis |
+| `log/log.jsonl` | `Log.info` / `Log.debug` / `Log.warn` output routed here by `Log.useJsonl()` |
+
+## backtest.jsonl event structure
+
+Every line in `backtest.jsonl` shares this envelope:
+
+```json
+{
+  "reportName": "backtest",
+  "symbol": "BTCUSDT",
+  "strategyName": "crypto_yoda_strategy",
+  "exchangeName": "ccxt-exchange",
+  "frameName": "aug_2026_frame",
+  "timestamp": "2026-08-14T09:31:00.000Z",
+  "data": { "action": "...", "...": "..." }
+}
+```
+
+All trade-relevant information lives inside `data`. The `frameName` field matches the value set in `addFrameSchema`, making it easy to distinguish results from different periods when comparing dump files.
+
+## data.action values
+
+### `idle`
+
+A clock tick with no open position. Contains only `currentPrice`. These events make up approximately 98% of the file by line count and are useless for trade analysis — filter them out first.
+
+```json
+{
+  "action": "idle",
+  "currentPrice": 61234.5
+}
+```
+
+<Tip>
+  Filter out `idle` events before any analysis. A single month of data with 13 symbols can produce hundreds of millions of idle rows. In `jq`: `jq 'select(.data.action != "idle")' dump/report/backtest.jsonl`. This step alone reduces a 237 MB file to roughly 23 MB.
+</Tip>
+
+### `opened`
+
+Emitted when the strategy enters a position. Contains the full entry context, including the original unmodified levels (used later to detect whether the stop was moved).
+
+```json
+{
+  "action": "opened",
+  "signalId": "1234567890-btcusdt",
+  "position": "long",
+  "priceOpen": 61234.5,
+  "priceTakeProfit": 64000.0,
+  "priceStopLoss": 58800.0,
+  "originalPriceOpen": 61234.5,
+  "originalPriceTakeProfit": 64000.0,
+  "originalPriceStopLoss": 58800.0,
+  "payload": { "levels": [61800, 62500, 63200, 63800, 64000] },
+  "note": "{\"signal\":{\"id\":1234,\"position\":\"long\",...},\"message\":{...}}"
+}
+```
+
+The `original*` fields are set once on entry and never modified. They are used for close-reason attribution (see below).
+
+### `active`
+
+Emitted every minute while a position is open. Adds running statistics on top of the current price.
+
+```json
+{
+  "action": "active",
+  "signalId": "1234567890-btcusdt",
+  "position": "long",
+  "priceOpen": 61234.5,
+  "priceTakeProfit": 64000.0,
+  "priceStopLoss": 62000.0,
+  "currentPrice": 62450.0,
+  "pnl": 1215.5,
+  "percentTp": 43.6,
+  "percentSl": -89.5,
+  "peakProfitPercentage": 2.0,
+  "peakProfitAbsolute": 1215.5,
+  "maxDrawdownPercentage": -0.4,
+  "maxDrawdownAbsolute": -245.0
+}
+```
+
+The `active` stream can be used to reconstruct the position trajectory: the highest ratchet level taken, the moment the stop was moved to breakeven, and the exact sequence of `percentTp` values.
+
+### `closed`
+
+Emitted once when the position exits.
+
+```json
+{
+  "action": "closed",
+  "signalId": "1234567890-btcusdt",
+  "position": "long",
+  "priceOpen": 61234.5,
+  "priceClose": 62000.0,
+  "closeReason": "stop_loss",
+  "duration": 187,
+  "pnl": 765.5,
+  "peakProfitPercentage": 2.0,
+  "maxDrawdownPercentage": -0.4
+}
+```
+
+## Close reason attribution
+
+`closeReason` has three meaningful values, and the distinction between them matters for understanding what actually closed the trade:
+
+| `closeReason` | `priceStopLoss` vs `originalPriceStopLoss` | Meaning |
+|---|---|---|
+| `"closed"` | any | `commitClosePending` fired — ratchet trailing stop triggered |
+| `"stop_loss"` | `!==` (stop was moved) | Stop hit after being moved to breakeven |
+| `"stop_loss"` | `===` (stop unchanged) | Honest stop — price hit the channel's original stop level |
+
+This three-way attribution requires no extra fields: compare `priceStopLoss` with `originalPriceStopLoss` in the `closed` event. A stop that was never moved is the channel's own money management at work; a moved stop that triggers is a breakeven zero; a ratchet close is the trailing exit doing its job.
+
+## log/log.jsonl structure
+
+When `Log.useJsonl()` is active in `config/setup.config.ts`, every `Log.info`, `Log.debug`, and `Log.warn` call writes a structured record:
+
+```json
+{
+  "type": "info",
+  "timestamp": "2026-08-14T09:31:00.000Z",
+  "createdAt": "2025-01-15T14:22:33.412Z",
+  "methodContext": {
+    "strategyName": "crypto_yoda_strategy",
+    "exchangeName": "ccxt-exchange",
+    "frameName": "aug_2026_frame"
+  },
+  "executionContext": {
+    "when": "2026-08-14T09:31:00.000Z",
+    "symbol": "BTCUSDT",
+    "backtest": true
+  },
+  "topic": "crypto_yoda trailing drift",
+  "args": [
+    {
+      "signalId": "1234567890-btcusdt",
+      "symbol": "BTCUSDT",
+      "position": "long",
+      "driftRatio": 0.142,
+      "driftRatioLimit": 0.3,
+      "currentLevel": 62500,
+      "step": 700
+    }
+  ]
+}
+```
+
+Key fields:
+
+| Field | Content |
+|---|---|
+| `timestamp` | Backtest clock time (the simulated `when` of the tick) |
+| `createdAt` | Real wall-clock time when the record was written |
+| `methodContext` | Strategy / exchange / frame names from async context |
+| `executionContext.when` | Same as `timestamp`; the simulated moment |
+| `executionContext.symbol` | The symbol being processed |
+| `topic` | Free-form channel string — use for grouping in analysis scripts |
+| `args[0]` | The payload object passed to `Log.info(topic, payload)` |
+
+## Log.info vs Log.debug conventions
+
+```typescript
+// Log.info — rare transitions: level taken, ratchet close, breakeven move
+Log.info("crypto_yoda level_up", {
+  signalId,
+  symbol,
+  position,
+  level: currentLevel,
+  priceStopLoss: newStop,
+  when: when.toISOString(),
+});
+
+// Log.debug — dense per-tick measurements used to derive thresholds
+// Only emit when the measurement is non-trivial (drift > 0 guard)
+if (driftRatio > 0) {
+  Log.debug("crypto_yoda trailing drift", {
+    signalId,
+    symbol,
+    position,
+    driftRatio,
+    driftRatioLimit: LEVEL_DRIFT_RATIO,
+    currentLevel,
+    step: levelStep,
+    when: when.toISOString(),
+  });
+}
+```
+
+`Log.info` marks state transitions that happen at most a handful of times per position — level advances, breakeven moves, ratchet closes. `Log.debug` records dense measurement streams: per-tick drift ratios, stagnation progress, anything you want to build a distribution from. Keeping the two levels separate makes it straightforward to load only `Log.info` events for a quick summary, or load only `Log.debug` events for threshold derivation without mixing the two.
+
+The standard analysis pattern is: parse `log.jsonl` → group by `topic` → within each topic group by `signalId` → compare percentile distributions of the payload field-of-interest against trade outcomes from `backtest.jsonl`. Payload fields should always be raw numbers (not formatted strings) and should include both the measured value and the current threshold so the log is self-annotating.

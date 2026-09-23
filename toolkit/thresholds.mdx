@@ -1,0 +1,124 @@
+---
+title: "Deriving thresholds from process distributions, not PnL"
+sidebarTitle: "Thresholds"
+description: "How to pick constants that survive walk-forward: structural rules first, numbers from process distributions, never fitted to one month of trades."
+---
+
+The most dangerous moment in any backtest project is when a single month of data produces a constant that looks exactly right. With 15–18 trades in a frame — the typical event count for one month of a Telegram signal channel — it is statistically impossible to distinguish a real structural threshold from pure overfitting. Every constant in this project follows one cardinal rule: **structural rules beat magic numbers; numbers come from process distributions, not trade outcomes; and any surviving constant must pass walk-forward before it is trusted.**
+
+## Why PnL-fitting is dangerous
+
+A constant fitted to maximise month-of-August returns has seen exactly 15–18 decisions. Its confidence interval is enormous. A threshold that separates "good trades" from "bad trades" in that sample is almost certainly describing the specific sequence of those 18 trades, not a general property of the market or the channel author's behaviour.
+
+The `LEVEL_DRIFT_RATIO = 0.3` constant in the `crypto_yoda_channel` strategy is a worked example of the correct approach. It could have been set at 0.22, which would have looked slightly better in the backtest month. It was not — because 0.22 was derived by looking at PnL outcomes, not at the distribution of the underlying process. The value actually used, 0.3, was derived from the noise ceiling of survived retrace ratios (described below) and then rounded conservatively. The month-of-backtest PnL impact of the difference between 0.22 and 0.3 is within the noise of 15–18 trades.
+
+## Structural rules first
+
+Before reaching for any numeric constant, ask whether the rule can be expressed structurally — in terms of the geometry of the signal itself rather than in terms of what produced positive PnL.
+
+**Breakeven after 50% progress to TP1.** When price has reached the halfway point between entry and the first take-profit level, move the stop to entry. This eliminates the entire category of "almost got there and reversed" losses without fitting any number. The threshold (50%) is a geometric midpoint: it is parameterised entirely by the signal's own structure and has no free parameter to overfit.
+
+**Level-ratchet with `LEVEL_DRIFT_RATIO = 0.3`.** When a take-profit level is crossed, the position's stop moves up to that level. If price then retraces back past that level by more than `LEVEL_DRIFT_RATIO × grid_step`, the position closes. The ratio 0.3 comes from a measured distribution (see below), not from the month's PnL. Crucially, `grid_step` is adaptive to the signal's own geometry — for BTC, a grid step is hundreds of dollars; for PENGU, it is a fraction of a cent. The same ratio 0.3 scales correctly without any per-symbol tuning.
+
+**Staleness gate: 15 minutes from publication.** The strategy only acts on posts that are at most 15 minutes old when the LLM cache tick fires. This threshold was not chosen to maximise returns. It was derived from the event-study finding that the directional edge lives at the 12–24h horizon but is essentially zero in the first 15–60 minutes — meaning the entry rule needs to be fast to capture the eventual move, not because a longer window produces worse PnL.
+
+## Distribution-based threshold process
+
+When a numeric constant is unavoidable, derive it from the distribution of the underlying process, not from trade outcomes. The process that produced `LEVEL_DRIFT_RATIO = 0.3` is a concrete example:
+
+<Steps>
+  <Step title="Emit dense telemetry with Log.debug">
+    In `main.test.ts` (not `main.strategy.ts`), add `Log.debug` calls that emit per-tick measurements. For the drift threshold, log every tick where `drift > 0`:
+
+    ```typescript
+    if (drift > 0) {
+      Log.debug("crypto_yoda trailing drift", {
+        signalId,
+        symbol,
+        position,
+        when: when.toISOString(),
+        driftRatio: drift / step,       // the ratio being thresholded
+        driftRatioLimit: LEVEL_DRIFT_RATIO,  // current limit for comparison
+        progressToTp1,
+        minutesActive,
+      });
+    }
+    ```
+
+    Throttle stagnation logs to avoid bloating the file — only log when `minutesActive % 15 === 0`. Log every level-up event at `Log.info` (not debug) since level-ups are rare state transitions.
+  </Step>
+  <Step title="Run the backtest to accumulate log.jsonl">
+    ```bash
+    npm start -- --backtest --ui --entry ./content/crypto_yoda_channel/main.test.ts
+    ```
+
+    The log file accumulates at `dump/log/log.jsonl`. Each line is one `Log` call: `{ type, timestamp, topic, args: [payload] }`.
+  </Step>
+  <Step title="Parse log.jsonl and build percentile distributions">
+    Write a throwaway analysis script (`debug.tmp.mjs`, delete after):
+
+    ```javascript
+    import { readFile } from "fs/promises";
+
+    const lines = (await readFile("dump/log/log.jsonl", "utf-8"))
+      .trim().split("\n")
+      .map((l) => JSON.parse(l));
+
+    const driftLines = lines.filter((l) => l.topic === "crypto_yoda trailing drift");
+    const bySignal = Map.groupBy(driftLines, (l) => l.args[0].signalId);
+    ```
+  </Step>
+  <Step title="Separate survived events from failure events">
+    Cross-reference each signal's drift measurements against `backtest.jsonl` to determine the eventual outcome — did the position later reach `level_up` (survived) or was it closed (failure)? A "survived" retrace is one where `driftRatio` was high but the position subsequently took the next level. A "failure" retrace is the last measurement before close.
+
+    ```javascript
+    // group drift ratios by outcome
+    const survivedRatios = [];
+    const failureRatios = [];
+
+    for (const [signalId, ticks] of bySignal) {
+      const outcome = backtestOutcomes.get(signalId); // from backtest.jsonl
+      const maxDrift = Math.max(...ticks.map((t) => t.args[0].driftRatio));
+      if (outcome === "level_up") survivedRatios.push(maxDrift);
+      else failureRatios.push(maxDrift);
+    }
+    ```
+  </Step>
+  <Step title="Find the noise ceiling">
+    Sort `survivedRatios` and read the maximum value. This is the highest retrace ratio that a position survived on its way to the next level. Any threshold at or above this value will never produce a false exit (closing a position that would have gone on to take the next level).
+
+    In the `crypto_yoda_channel` August backtest: the noise ceiling was **0.186** at `n=62` survived retrace measurements.
+  </Step>
+  <Step title="Set the constant conservatively">
+    Set the constant above the noise ceiling with a small margin — not at the exact ceiling, and not at the point of maximum PnL separation. The ceiling of 0.186 was rounded up to **0.3** (not 0.2, not 0.22). This leaves room for the distribution to shift slightly on unseen data without immediately producing false exits.
+
+    ```typescript
+    // In main.strategy.ts
+    const LEVEL_DRIFT_RATIO = 0.3; // noise ceiling 0.186 at n=62 (Aug backtest); conservative margin
+    ```
+  </Step>
+</Steps>
+
+## Walk-forward validation
+
+Before any constant is treated as a rule rather than a hypothesis, it must be tested on data it has never seen.
+
+**Extend the backtest frame.** Edit `modules/backtest.module.ts` to cover 4–6 months. Pull the candles:
+
+```bash
+npm start -- --backtest --cache --entry ./content/crypto_yoda_channel/main.strategy.ts
+```
+
+**Use `Sweep` for parameter grid search.** `Sweep` from `backtest-kit` runs the same strategy across a grid of parameter values and reports per-parameter performance. Use it to confirm that the chosen constant is not at a local maximum — the PnL curve should be relatively flat near the chosen value, not a sharp peak.
+
+**Use `Walker` for in-sample / out-of-sample split.** `Walker` optimises on a rolling in-sample window and verifies on the immediately following out-of-sample window. If the constant found in-sample holds on the out-of-sample window across multiple rolling periods, it has earned provisional trust.
+
+**A/B two rules.** To compare two variants (e.g., `LEVEL_DRIFT_RATIO = 0.3` versus structural breakeven only), run them as two separate `strategyName` values in the same backtest. The backtest engine tracks them independently through the same price data with no look-ahead bias.
+
+<Warning>
+Any constant derived from a single month's backtest — regardless of how principled the derivation process was — is a hypothesis. Treat it as a hypothesis until it survives walk-forward. The backtest in this project covered one month with 16–18 events per question. That is enough to identify candidates and eliminate obvious nonsense; it is not enough to certify any constant as final.
+</Warning>
+
+<Tip>
+Add `Log.debug` telemetry only in `main.test.ts`, not `main.strategy.ts`. The production strategy runs continuously in live mode — debug logging there would fill disk and slow execution. Keep the test file as a "snippets library" (the project convention) with all telemetry, breakeven logic, and threshold experiments ready to copy back in when analysis is needed. Log only when `drift > 0` and throttle stagnation logs with a `minutesActive % 15 === 0` guard to keep `log.jsonl` at an analysable size rather than hundreds of megabytes of idle-tick noise.
+</Tip>

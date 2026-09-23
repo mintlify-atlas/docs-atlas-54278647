@@ -1,0 +1,185 @@
+---
+title: "Crypto Yoda channel: range + targets + stop strategy"
+sidebarTitle: "Crypto Yoda"
+description: "Parse range + five-target + stop posts with Ollama, enter within 15 minutes, and trail with an adaptive level-ratchet that replaces the author's −4% EV plan."
+---
+
+The `crypto_yoda_channel` strategy is the reference implementation of the classic signal format: each post gives an entry range, five take-profit targets, and a hard stop. The LLM extracts that structure into a typed schema, the engine enters at market within 15 minutes of publication, and a level-ratchet trailer turns each crossed target into a trailing floor — replacing the author's own plan, which event-study showed has an expected value of roughly −3.5 to −4 % per trade unleveraged.
+
+## Channel post format
+
+The author publishes two distinct post types. The strategy must recognise both.
+
+### Signal post — creates an entry
+
+```
+СИГНАЛ #BTC/USDT
+
+📛 Риск сигнала: 6/10
+
+🔑 Открыть ЛОНГ в диапазоне $78600 - $79400 - 6% депозита, плечо X15
+
+🍒 Цели:
+
+🔘 Закрыть по $80300
+🔘 Закрыть по $80900
+🔘 Закрыть по $82000
+🔘 Закрыть по $83200
+🔘 Закрыть по $84500
+
+❗️ СТОП ЛОСС: $77400
+```
+
+The LLM extracts: position direction (`ЛОНГ` → `long`), entry range `from=78600 to=79400`, five numeric targets, and the stoploss.
+
+### Result post — filtered out, no entry
+
+```
+#PENGU/USDT
+Тейк-профит 1 ✅
+Тейк-профит 2 ✅
+Тейк-профит 3 ✅
+Тейк-профит 4 ✅
+
+Прибыль: 53.2296% 📈
+Период: 1 день 10 часов ⏰
+```
+
+These posts pass the pre-LLM coin filter (`#PENGU`), but the prompt explicitly tells the model to return `position: "wait"` for result publications — the strategy then returns `null`.
+
+## LLM schema: `TradingPositionFormat`
+
+The schema is passed to `generateObject` (json-inference) as a `FormatModel`. Tool-call grammar forces the model to return a valid object; recursive validation retries on type mismatches.
+
+| Field | Type | Default when absent | Description |
+|---|---|---|---|
+| `id` | `number` | `-1` | ID of the source post; strategy discards the signal if this id is not in the scraped window |
+| `symbol` | `string` | — | Ticker normalised to `*USDT` — `#BTC/USDT` → `BTCUSDT` |
+| `position` | `"long" \| "short" \| "wait"` | `"wait"` | `wait` means no entry signal |
+| `entryRange.from` | `number` | `0` | Lower bound of the entry range |
+| `entryRange.to` | `number` | `0` | Upper bound of the entry range |
+| `targets` | `number[]` | `[]` | Five take-profit levels; `items: { type: "number" }` ensures numeric elements |
+| `stoploss` | `number` | `0` | Hard stop from the post |
+| `reasoning` | `string` | — | Model's explanation — stored in signal `note` for debugging |
+
+<Note>
+`items: { type: "number" }` on the `targets` array is mandatory. Without it Ollama's tool grammar returns a mix of number and string elements that silently break downstream arithmetic.
+</Note>
+
+## Entry logic (`getSignal`)
+
+`getSignal` is wrapped in `Cache.file` (bucket `crypto_yoda_entry_v3`, interval `5m`). The cache key is `SYMBOL_timestamp`, so the LLM is called at most once every five minutes per symbol.
+
+Inside the cache the function:
+
+1. Calls `scrapeLookback` for the last `FRESH_WINDOW_MINUTES` minutes of channel posts.
+2. Filters posts to only those whose text contains the coin tag — e.g. `#BTC` for `BTCUSDT`.
+3. Returns `{ entry: null }` immediately if nothing remains, saving the LLM call.
+4. Sends all matching posts to `generateObject` (model `gemma4:31b-cloud`), each formatted as `ID <id>\n\n<content>\n\n[<isodate>]: https://t.me/channel/<id>`.
+5. Locates the source post by `entry.id`; if the model returns an id that is not in the window the signal is discarded.
+
+The `getSignal` function in `addStrategySchema` applies three additional rejection gates before creating a position:
+
+| Gate | Condition | Reason |
+|---|---|---|
+| No entry | `entry` is null or `position === "wait"` | Nothing to act on |
+| Post too old | `when − new Date(message.date) > 15 × 60 000 ms` | Edge lives near publication |
+| Incomplete targets | `!entry.targets[2]` | Need at least three levels for the ratchet |
+
+**There is no price gate.** An event study showed that the strongest signals (momentum) never pull back into the entry zone at all — the two best trades of the month were up +11.2% and +6.6% before ever touching the `from–to` range. A "price must be in zone" gate would have silently discarded them. The range itself acts as a wall of subscriber limit orders: price either respects it cleanly (breach ≤ 0.8%) or blows through it entirely (6.8–7.7%), past every subscriber's stop.
+
+At entry:
+- **Take-profit** is set to the farthest target: `Math.max(...targets)` for long, `Math.min(...targets)` for short.
+- **Stop-loss** comes directly from the post (`entry.stoploss`).
+- All five levels are stored in `payload.levels` for the ratchet listener.
+
+## Level-ratchet trailing (`listenActivePing`)
+
+The ratchet turns each crossed TP level into a trailing floor. On every active-position tick, three pure functions measure the current state:
+
+```typescript
+function getCurrentLevel(
+  position: Position,
+  levels: number[],
+  currentPrice: number
+) {
+  if (position === "long") {
+    return levels.filter((level) => currentPrice >= level).length;
+  }
+  return levels.filter((level) => currentPrice <= level).length;
+}
+
+function getLevelStep(levels: number[], lastLevel: number) {
+  const levelPrice = levels[lastLevel - 1];
+  const neighborPrice =
+    lastLevel > 1 ? levels[lastLevel - 2] : levels[lastLevel];
+  return Math.abs(levelPrice - neighborPrice);
+}
+
+function getLevelDrift(
+  position: Position,
+  levels: number[],
+  lastLevel: number,
+  currentPrice: number
+) {
+  const levelPrice = levels[lastLevel - 1];
+  const drift =
+    position === "long"
+      ? levelPrice - currentPrice
+      : currentPrice - levelPrice;
+  return Math.max(drift, 0);
+}
+```
+
+The listener logic:
+
+1. **Level advance**: if `currentLevel > lastLevel`, fire a notification ("Reached level N of 5") and update `LEVEL_STATE`.
+2. **No levels hit yet** (`lastLevel === 0`): the ratchet is silent — the position lives until the exchange TP or SL.
+3. **Retrace check**: compute `drift = getLevelDrift(...)` and `step = getLevelStep(...)`. If `drift > step × LEVEL_DRIFT_RATIO` (0.3), close the position via `commitClosePending`.
+
+The 0.3 slack is adaptive to grid density by design. PENGU steps are ~0.3–0.9 %; BTC steps are hundreds of dollars. Because `drift` and `step` are in the same price units, the ratio stays meaningful regardless of coin or grid tightness. The value 0.3 was derived from the process distribution of survived retraces (noise ceiling 0.186, n=62) — not fitted to PnL.
+
+## Key constants
+
+| Constant | Value | Purpose |
+|---|---|---|
+| `LEVEL_DRIFT_RATIO` | `0.3` | Ratchet slack as a fraction of the local grid step |
+| `FRESH_WINDOW_MINUTES` | `15` | Scrape window and maximum post age for entry |
+| `Cache.file` interval | `5m` | Channel check (and LLM call when posts exist) per symbol |
+| Cache name | `crypto_yoda_entry_v3` | Bump to `v4` whenever schema or post-selection logic changes |
+
+## Key findings
+
+One month of backtest across 16–18 entries:
+
+| Metric | Value |
+|---|---|
+| Direction correct at 24h | 13 / 18 (72%), mean +1.42% unleveraged |
+| TP1 hit rate | 44% |
+| TP2 hit rate | 19% |
+| TP3 hit rate | 6% |
+| TP4 / TP5 hit rate | 0% (never) |
+| Naive "follow the post" EV | ≈ −3.5 … −4% per trade unleveraged |
+| Level-ratchet only | −0.31% for the month |
+| Ratchet + structural breakeven | **+3.37%** (7 ratchet wins +7.84%, 8 breakeven zeros, 1 honest −4.47% stop) |
+
+<Note>
+These are hypothesis-grade numbers from one month (16–18 events per claim), not proof. The method is reproducible from `measure-items` + `candle-items` with the scripts in `content/crypto_yoda_channel/assets/`.
+</Note>
+
+## Run commands
+
+```bash
+# backtest (frame defined in modules/backtest.module.ts)
+npm start -- --backtest --ui --entry ./content/crypto_yoda_channel/main.strategy.ts
+
+# same, pre-warming 1m candles into MongoDB (faster replay)
+npm start -- --backtest --ui --entry ./content/crypto_yoda_channel/main.strategy.ts --cache
+
+# live mode
+npm start -- --live --ui --entry ./content/crypto_yoda_channel/main.strategy.ts
+```
+
+<Warning>
+**Changing the LLM schema or post-selection logic requires bumping the cache name.** The current name is `crypto_yoda_entry_v3`. If you modify `TradingPositionFormat`, the filter logic, or the message format sent to the model, rename the cache (e.g. `v3` → `v4`) before running again — otherwise stale responses from the old schema will be replayed unchanged from MongoDB.
+</Warning>

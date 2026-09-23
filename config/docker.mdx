@@ -1,0 +1,154 @@
+---
+title: "Run MongoDB and Redis with Docker for local development"
+sidebarTitle: "Docker Setup"
+description: "Start the MongoDB and Redis containers required by backtest-kit, and use the devenv container for a full in-repo development environment."
+---
+
+The project depends on two external services — MongoDB for the LLM cache and OHLCV candle storage, and Redis for backtest-kit's internal state management. Both are provided as standalone Docker Compose files under `docker/`, so you can start them independently without touching the main compose file. A third compose file at the repo root brings up a complete development environment container.
+
+## MongoDB
+
+MongoDB is required for two collections in the `backtest-kit` database:
+
+- **`measure-items`** — persisted LLM cache. Every `Cache.file` / `Cache.fn` call writes its result here so the same Telegram window is never sent to the model twice.
+- **`candle-items`** — 1-minute OHLCV data downloaded by the `--cache` flag. The backtest engine reads from this collection instead of hitting the exchange during replay.
+
+Connection string used by `@backtest-kit/mongo`:
+
+```
+mongodb://localhost:27017/backtest-kit
+```
+
+Start MongoDB with:
+
+```bash
+cd docker/mongo
+docker compose up -d
+```
+
+The `docker/mongo/docker-compose.yaml` file:
+
+```yaml
+version: '3.8'
+services:
+  mongodb:
+    image: mongodb/mongodb-community-server:8.0.4-ubi8
+    container_name: mongodb
+    ports:
+      - '27017:27017'
+    volumes:
+      - ./mongo_data:/data/db
+    restart: always
+volumes:
+  mongo_data:
+```
+
+The data directory `docker/mongo/mongo_data/` is listed in `docker/mongo/.gitignore` and is never committed.
+
+## Redis
+
+Redis is used by backtest-kit for state management between symbol workers.
+
+Start Redis with:
+
+```bash
+cd docker/redis
+docker compose up -d
+```
+
+The `docker/redis/docker-compose.yaml` file:
+
+```yaml
+version: '3.8'
+services:
+  redis:
+    image: redis:7.4.1
+    container_name: redis
+    ports:
+      - "6379:6379"
+    environment:
+      - REDIS_PASSWORD=mysecurepassword
+    command: ["redis-server", "--requirepass", "mysecurepassword"]
+    volumes:
+      - ./redis_data:/data
+    restart: always
+volumes:
+  redis_data:
+```
+
+The data directory `docker/redis/redis_data/` is listed in `docker/redis/.gitignore` and is never committed.
+
+## Full development environment
+
+The root `docker-compose.yaml` runs a `tripolskypetr/devenv` image that mounts the entire repository into the container at `/app` and exposes port `60050` for the backtest-kit UI:
+
+```yaml
+services:
+  app:
+    image: tripolskypetr/devenv
+    platform: linux/amd64
+    ports:
+      - "60050:60050"
+    volumes:
+      - "./:/app"
+```
+
+Start it from the repo root:
+
+```bash
+docker compose up -d
+```
+
+This container is useful for running backtests in a reproducible Linux environment without installing Node.js locally. The MongoDB and Redis containers still need to be started separately in their own subdirectories.
+
+## Starting all services
+
+<Steps>
+  <Step title="Start MongoDB">
+    ```bash
+    cd docker/mongo && docker compose up -d
+    ```
+  </Step>
+  <Step title="Start Redis">
+    ```bash
+    cd docker/redis && docker compose up -d
+    ```
+  </Step>
+  <Step title="(Optional) Start the dev environment container">
+    ```bash
+    docker compose up -d   # from repo root
+    ```
+  </Step>
+  <Step title="Verify connectivity">
+    Run a quick connection test to confirm both services are reachable before starting a backtest:
+    ```bash
+    node -e "const mongoose = require('mongoose'); mongoose.connect('mongodb://localhost:27017/backtest-kit').then(() => { console.log('MongoDB OK'); process.exit(0); })"
+    ```
+  </Step>
+</Steps>
+
+## Volume and session notes
+
+<CardGroup cols={2}>
+  <Card title="Gitignored volumes" icon="database">
+    `docker/mongo/mongo_data/` and `docker/redis/redis_data/` are local bind-mount directories listed in their respective `.gitignore` files. They are created automatically on first `docker compose up` and persist across container restarts.
+  </Card>
+  <Card title="session.txt" icon="key">
+    The Telegram MTProto session file (`session.txt`) is created in the channel folder (`content/<channel>/session.txt`) when you run `signIn()`. It is listed in the root `.gitignore` and is not included in any Docker volume — you must create it manually on the host before running the dev container.
+  </Card>
+</CardGroup>
+
+<Note>
+  `session.txt` must exist in the channel folder **on the host**, not inside the devenv container. Because the repo is bind-mounted at `/app`, the file will be visible inside the container at `/app/content/<channel>/session.txt` once it is created on the host. Run the `signIn()` step from the host machine (or from inside the container with an interactive terminal) before running any channel strategy.
+</Note>
+
+## Production checklist
+
+For a production deployment, replace the local bind-mount volumes with named Docker volumes to survive container recreation, and ensure candles are fully pre-warmed before going live:
+
+```bash
+# Pre-warm all symbols for the configured frame before starting live mode
+npm start -- --backtest --cache --entry ./content/<channel>/main.strategy.ts
+```
+
+Pre-warming fills `candle-items` with every 1-minute bar across `startDate`–`endDate`. Without it, the backtest engine will attempt live exchange fetches during replay, which is significantly slower and subject to rate limits.

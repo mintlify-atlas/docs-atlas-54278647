@@ -1,0 +1,207 @@
+---
+title: "Backtesting signals with backtest-kit and zero look-ahead bias"
+sidebarTitle: "Backtest Engine"
+description: "How backtest-kit replays 1-minute candles, manages position lifecycle, and enforces zero look-ahead bias via scrapeLookback's when parameter."
+---
+
+Backtesting a Telegram signal channel is harder than it sounds: the model must see exactly what a trader saw at the moment of each post, no more and no less. `backtest-kit` provides the execution clock, and `scrapeLookback`'s `when` parameter is how look-ahead bias is shut out entirely. This page covers the tick loop, position lifecycle, the level-ratchet trailing mechanism, and the state management API.
+
+## 1-minute candle replay
+
+`backtest-kit` replays OHLCV data one candle at a time. Each 1-minute candle is a tick. On every tick the engine:
+
+1. Calls `getSignal(symbol, when)` — or fires `listenIdlePing` if the strategy is event-driven.
+2. Checks for a pending `commitCreateSignal` and opens a position if one exists.
+3. If a position is already open, fires `listenActivePing`.
+4. Emits `opened` / `active` / `closed` events to `dump/report/backtest.jsonl`.
+
+The `when` value passed to every callback is the **exact timestamp of the current candle**. Passing it directly into `scrapeLookback` guarantees that only posts published before that moment are visible. Future posts never appear in the window.
+
+```typescript
+// scrapeLookback with when from the backtest tick — zero look-ahead
+const messages = await scrapeLookback({
+  channel: CHANNEL_NAME,
+  limit: FRESH_WINDOW_MINUTES,
+  dimension: "minute",
+  when,   // ← backtest tick timestamp; future posts are invisible
+});
+```
+
+## Frame schema and candle pre-warming
+
+The replay window is defined in `modules/backtest.module.ts`:
+
+```typescript
+addFrameSchema({
+  frameName: "aug_2026_frame",
+  interval: "1m",
+  startDate: new Date("2026-08-01T00:00:00Z"),
+  endDate: new Date("2026-08-31T23:59:59Z"),
+  note: "August 2026",
+});
+```
+
+Running with `--cache` pre-warms all candles for every symbol in `SYMBOL_LIST` into the `candle-items` MongoDB collection before the replay starts. Without pre-warming the engine fetches candles live from Binance on every tick, which is slow. With pre-warming it reads from MongoDB — orders of magnitude faster.
+
+```bash
+# With candle pre-warming (recommended for month-long replays)
+npm start -- --backtest --ui --entry ./content/crypto_yoda_channel/main.strategy.ts --cache
+```
+
+## Per-symbol parallelism
+
+Each symbol in `SYMBOL_LIST` gets its own `Backtest.background` context. They run concurrently, each filtering the Telegram channel for its own coin tag and maintaining its own position state.
+
+```typescript
+for (const symbol of SYMBOL_LIST) {
+  if (values.backtest) {
+    Backtest.background(symbol, {
+      exchangeName: exchangeSchema.exchangeName,
+      strategyName: strategySchema.strategyName,
+      frameName: frameSchema.frameName,
+    });
+  }
+}
+```
+
+The LLM cache key includes the symbol (`BTCUSDT_<timestamp>`), so different symbols never share a cached response even when their tick timestamps align.
+
+## Position lifecycle
+
+Every position moves through three states, each written to `backtest.jsonl`:
+
+<Steps>
+  <Step title="opened">
+    Written once when a position is created. Contains `signalId`, `position`, `priceOpen`, `priceTakeProfit`, `priceStopLoss`, their `original*` copies (unchanged for the life of the trade), `payload` (strategy-specific data — in crypto_yoda this is `{ levels: [...] }`), and `note` (full JSON with the parsed signal and source post).
+  </Step>
+  <Step title="active">
+    Written on every subsequent minute tick while the position is open. Adds `pnl`, `percentTp` (progress toward take-profit), `percentSl` (progress toward stop-loss), `peakProfit`, and `maxDrawdown`. Streaming these records reconstructs the full price trajectory of any trade.
+  </Step>
+  <Step title="closed">
+    Written once when the position closes. Contains `closeReason`, `duration`, and final `pnl` / `peakProfitPercentage` / `maxDrawdownPercentage`.
+  </Step>
+</Steps>
+
+### Attributing close reasons
+
+The engine records `closeReason` without a separate "how was this closed" flag. Attribution is computed from the report fields:
+
+| `closeReason` | `priceStopLoss` vs `originalPriceStopLoss` | Meaning |
+|---|---|---|
+| `"closed"` | — | `commitClosePending` was called (ratchet exit) |
+| `"stop_loss"` | shifted (`!==` original) | Breakeven — SL was moved to entry, then hit |
+| `"stop_loss"` | unchanged (`===` original) | Honest stop — the channel's stated stop level was hit |
+| `"take_profit"` | — | TP level was reached |
+
+## Level-ratchet trailing (crypto_yoda)
+
+The crypto_yoda strategy does not use a fixed trailing stop. Instead, it tracks which of the five take-profit levels the price has crossed and closes the position if price retreats too far from the last crossed level.
+
+Three helper functions implement the logic:
+
+```typescript
+// How many levels has price crossed in the signal direction?
+function getCurrentLevel(position: Position, levels: number[], currentPrice: number) {
+  if (position === "long") {
+    return levels.filter((level) => currentPrice >= level).length;
+  }
+  return levels.filter((level) => currentPrice <= level).length;
+}
+
+// Dollar distance between the last crossed level and its neighbor (grid step size)
+function getLevelStep(levels: number[], lastLevel: number) {
+  const levelPrice = levels[lastLevel - 1];
+  const neighborPrice = lastLevel > 1 ? levels[lastLevel - 2] : levels[lastLevel];
+  return Math.abs(levelPrice - neighborPrice);
+}
+
+// Dollar distance that price has retreated from the last crossed level
+function getLevelDrift(position: Position, levels: number[], lastLevel: number, currentPrice: number) {
+  const levelPrice = levels[lastLevel - 1];
+  const drift = position === "long"
+    ? levelPrice - currentPrice
+    : currentPrice - levelPrice;
+  return Math.max(drift, 0);
+}
+```
+
+`LEVEL_DRIFT_RATIO = 0.3` is the maximum allowed drift expressed as a fraction of the grid step. A retreat beyond 30% of the step closes the position. The ratio is adaptive: when PENGU levels are 0.3–0.9% apart the tolerance is small in dollar terms; when BTC levels are hundreds of dollars apart the tolerance scales with the grid. The constant was derived from the empirical distribution of survived retraces (noise ceiling 0.186 at n=62), not fitted to PnL outcomes.
+
+The full `listenActivePing` ratchet, taken verbatim from `content/crypto_yoda_channel/main.strategy.ts`:
+
+```typescript
+listenActivePing(async ({ data, currentPrice, backtest, when }) => {
+  const levels = <number[]>data.payload.levels;
+
+  if (!levels?.length) {
+    return;
+  }
+
+  const currentLevel = getCurrentLevel(<Position>data.position, levels, currentPrice);
+  const { lastLevel } = await LEVEL_STATE.getState();
+
+  if (currentLevel > lastLevel) {
+    await commitSignalNotify(data.symbol, {
+      notificationNote: str.newline(
+        `Достигнут уровень ${currentLevel} из ${levels.length} (цель ${levels[currentLevel - 1]})`,
+        `Трейлинг уровней продолжает сопровождение`,
+      ),
+    });
+    await LEVEL_STATE.setState({ lastLevel: currentLevel });
+    return;
+  }
+
+  if (!lastLevel) {
+    return;
+  }
+
+  const drift = getLevelDrift(<Position>data.position, levels, lastLevel, currentPrice);
+  const step = getLevelStep(levels, lastLevel);
+  const driftRatio = drift / step;
+
+  if (drift > step * LEVEL_DRIFT_RATIO) {
+    await commitSignalNotify(data.symbol, {
+      notificationNote: str.newline(
+        `Цена откатилась за уровень ${lastLevel} на ${(driftRatio * 100).toFixed(0)}% шага при люфте ${LEVEL_DRIFT_RATIO * 100}%`,
+        `Позиция закрыта по трейлингу уровней`,
+      ),
+    });
+    await commitClosePending(data.symbol);
+  }
+});
+```
+
+When a new level is crossed, `lastLevel` is updated in `LEVEL_STATE` and the position continues. When drift exceeds the threshold, `commitClosePending` closes it.
+
+## Breakeven rule
+
+The structural breakeven rule is: once price reaches 50% of the distance from entry to TP1, move the stop-loss to the entry price. This eliminates the class of losses where price "almost made it" and reversed — without a magic number. `commitBreakeven` executes the move:
+
+```typescript
+// Example: move SL to breakeven after 50% progress to TP1
+if (percentTp >= 0.5 && !BREAKEVEN_STATE.triggered) {
+  await commitBreakeven(symbol);
+  BREAKEVEN_STATE.triggered = true;
+}
+```
+
+A `stop_loss` close with a shifted SL (detected by `priceStopLoss !== originalPriceStopLoss` in the report) is attributed as a breakeven zero, not as an honest stop.
+
+## State management
+
+`backtest-kit` provides per-signal state scoped automatically by the execution context. The `State` class is the preferred API:
+
+```typescript
+const LEVEL_STATE = new State({
+  initialData: { lastLevel: 0 },
+  name: "level_state",
+});
+
+// Inside listenActivePing — context is captured automatically
+const { lastLevel } = await LEVEL_STATE.getState();
+await LEVEL_STATE.setState({ lastLevel: currentLevel });
+```
+
+<Note>
+  Use instance methods `state.getState()` / `state.setState()` rather than the static `State._getState()` / `State._setState()`. The instance form resolves the execution context automatically — inside `listenActivePing` you do not need to pass any identifier. Do not call `State.enable()` — the `@backtest-kit/cli` loader does that for you.
+</Note>

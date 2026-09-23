@@ -1,0 +1,173 @@
+---
+title: "MongoDB queries for LLM cache and candle inspection"
+sidebarTitle: "MongoDB Queries"
+description: "Query measure-items and candle-items collections to inspect LLM verdicts, compare cache versions, and run point-in-time price lookups."
+---
+
+The backtest engine writes everything it computes into two MongoDB collections: `measure-items` (the persisted LLM cache) and `candle-items` (1-minute OHLCV data warmed by `--cache`). Together they are the complete raw material for every quantitative claim in this project — hit rates, entry-zone behaviour, directional move distributions, and the event study that located the edge at the 12–24h horizon rather than the 15–60 minute window the seller implies.
+
+## Connection
+
+The database is `backtest-kit` on the default local MongoDB instance. All analysis scripts connect via `mongoose.createConnection`:
+
+```javascript
+import mongoose from "mongoose";
+
+const conn = await mongoose.createConnection("mongodb://localhost:27017/backtest-kit").asPromise();
+const db = conn.getClient().db("backtest-kit");
+```
+
+For quick one-off queries you can use `node -e` with the same pattern using CommonJS require:
+
+```bash
+node -e "
+const mongoose = require('mongoose');
+(async () => {
+  const conn = await mongoose.createConnection('mongodb://localhost:27017/backtest-kit').asPromise();
+  const db = conn.getClient().db('backtest-kit');
+  // your query here
+  process.exit(0);
+})();
+"
+```
+
+## measure-items — the LLM cache
+
+Every call to `Cache.file` or `Cache.fn` persists its result in `measure-items`. Each document has:
+
+- **`bucket`** — cache name plus interval, e.g. `"crypto_yoda_entry_v3_5m_0"`. The suffix `_0` is appended by the cache framework. The name changes whenever the LLM schema or post-selection logic changes — old and new cache versions coexist by design.
+- **`entryKey`** — `"SYMBOL_timestamp"` where timestamp is milliseconds since epoch at the tick when the cache was populated, e.g. `"BTCUSDT_1722470400000"`.
+- **`payload.data`** — whatever the wrapped function returned. For channel strategies this is `{ entry, message }`. When `entry` is `null`, the post window was empty or contained no signal for this symbol — the LLM was not called.
+
+### List all buckets and their record counts
+
+```javascript
+const buckets = await db.collection("measure-items").aggregate([
+  { $group: { _id: "$bucket", count: { $sum: 1 } } },
+]).toArray();
+
+for (const b of buckets) {
+  console.log(`${b._id}: ${b.count} records`);
+}
+```
+
+Run this first after any backtest to understand what was populated. Multiple versions of the same cache (`_v1`, `_v2`, `_v3`) will appear separately — this is expected and intentional.
+
+### Get all non-null model verdicts for a bucket
+
+```javascript
+const docs = await db.collection("measure-items")
+  .find({
+    bucket: "crypto_yoda_entry_v3_5m_0",
+    "payload.data.entry.position": { $in: ["long", "short"] },
+  })
+  .sort({ entryKey: 1 })
+  .toArray();
+
+for (const d of docs) {
+  const e = d.payload.data.entry;
+  const [symbol, ts] = d.entryKey.split("_");
+  const when = new Date(parseInt(ts)).toISOString().slice(0, 16);
+  console.log([symbol, when, e.position, `post=${e.id}`, e.reasoning].join("\t"));
+}
+```
+
+This is the fastest way to audit whether the model is parsing correctly across the full month. Check that positions match expected directions, that IDs reference the right posts, and that the reasoning field reflects actual post content rather than a hallucinated rationale.
+
+### Compare two cache versions by entryKey
+
+When you change the LLM schema or prompt and want to verify the model's numeric output hasn't shifted:
+
+```javascript
+const v1 = await db.collection("measure-items")
+  .find({ bucket: "crypto_yoda_entry_v1_5m_0", "payload.data.entry": { $ne: null } })
+  .toArray();
+
+const v2Map = new Map(
+  (await db.collection("measure-items")
+    .find({ bucket: "crypto_yoda_entry_v3_5m_0", "payload.data.entry": { $ne: null } })
+    .toArray()
+  ).map((d) => [d.entryKey, d])
+);
+
+for (const d1 of v1) {
+  const d2 = v2Map.get(d1.entryKey);
+  if (!d2) continue;
+  const e1 = d1.payload.data.entry;
+  const e2 = d2.payload.data.entry;
+  const posMatch = e1.position === e2.position;
+  const idMatch = e1.id === e2.id;
+  const fromMatch = e1.entryRange?.from === e2.entryRange?.from;
+  console.log(`${d1.entryKey}: pos=${posMatch} id=${idMatch} from=${fromMatch} reasoning_match=${e1.reasoning === e2.reasoning}`);
+}
+```
+
+<Note>
+The model is not deterministic — the `reasoning` field and even its language can vary between runs on identical inputs. Numeric fields (prices, IDs) and the `position` enum are stable because the tool-call grammar in json-inference pins the structure. Always diff every field; "the numbers match" is not a complete comparison.
+</Note>
+
+## candle-items — 1-minute OHLCV
+
+The `--cache` flag on a backtest run downloads 1-minute candles for every symbol in the backtest frame and stores them in `candle-items`. Fields:
+
+- **`symbol`** — e.g. `"BTCUSDT"`
+- **`interval`** — always `"1m"` for candles populated by `--cache`
+- **`timestamp`** — milliseconds since epoch, candle open time
+- **`open`, `high`, `low`, `close`, `volume`**
+
+### Point-in-time price lookup
+
+```javascript
+const candle = await db.collection("candle-items").findOne({
+  symbol: "BTCUSDT",
+  interval: "1m",
+  timestamp: 1722470400000,
+});
+const price = candle?.close ?? null;
+```
+
+If `price` is `null`, the candle is missing — run `--cache` to warm candles for the relevant date range.
+
+### Range query for event study
+
+```javascript
+const t0 = 1722470400000; // signal timestamp in ms
+const candles = await db.collection("candle-items")
+  .find({
+    symbol: "BTCUSDT",
+    interval: "1m",
+    timestamp: { $gte: t0, $lte: t0 + 1440 * 60_000 },
+  })
+  .sort({ timestamp: 1 })
+  .toArray();
+```
+
+## The event-study pattern
+
+The full flow from signal to directional move at each horizon is:
+
+1. Load all non-null verdicts from `measure-items` — these provide symbol, direction (`position`), and the tick timestamp extracted from `entryKey`.
+2. For each signal, look up the close price at `timestamp` (the entry candle) and at each horizon offset (`timestamp + h * 60_000`) from `candle-items`.
+3. Compute the directional move: `((p1 - p0) / p0) * 100 * (dir === "long" ? 1 : -1)`.
+4. For pre-post drift, use negative offsets: `timestamp - h * 60_000`.
+5. Aggregate mean, median, and hit-rate (fraction of moves > 0) per horizon.
+
+This is exactly what `event-study.mjs` does. Run it directly or adapt the pattern inline:
+
+```javascript
+const HORIZONS = [15, 60, 240, 720, 1440]; // minutes
+
+for (const signal of signals) {
+  const p0 = await candles.findOne({ symbol: signal.symbol, interval: "1m", timestamp: signal.ts });
+  for (const h of HORIZONS) {
+    const p1 = await candles.findOne({ symbol: signal.symbol, interval: "1m", timestamp: signal.ts + h * 60_000 });
+    if (!p0 || !p1) continue;
+    const move = ((p1.close - p0.close) / p0.close) * 100 * (signal.dir === "long" ? 1 : -1);
+    // accumulate into stats[h]
+  }
+}
+```
+
+<Tip>
+Run `node -e` queries from the project root where `node_modules` is available. Structure each query to answer one specific question — hit rate at a horizon, percentile distribution of a ratio — rather than dumping raw documents. Dumping full collections into a terminal produces noise; a single aggregated number is what the analysis actually needs.
+</Tip>

@@ -1,0 +1,128 @@
+---
+title: "Configure trading symbols and backtest time frame"
+sidebarTitle: "Symbols & Frame"
+description: "Edit SYMBOL_LIST to set which *USDT pairs to track, and configure addFrameSchema to define the backtest period and candle pre-warm range."
+---
+
+The trading symbols and the backtest time window are the two primary knobs you turn before every new run. `SYMBOL_LIST` controls which pairs get a strategy instance, and `addFrameSchema` tells the engine where in time to replay. Both settings are plain TypeScript constants — there is no YAML or environment-variable layer.
+
+## SYMBOL_LIST
+
+`SYMBOL_LIST` is hardcoded at the top of `config/loader.config.ts`. Edit this array to add or remove trading pairs — every entry must be a Binance spot symbol of the form `*USDT`.
+
+```typescript
+// config/loader.config.ts
+const SYMBOL_LIST = [
+  "BTCUSDT",
+  "POLUSDT",
+  "ZECUSDT",
+  "HYPEUSDT",
+  "DOGEUSDT",
+  "SOLUSDT",
+  "PENGUUSDT",
+  "TRXUSDT",
+  "HBARUSDT",
+  "NEARUSDT",
+  "FARTCOINUSDT",
+  "ETHUSDT",
+  "PUMPUSDT",
+];
+
+Object.assign(globalThis, { SYMBOL_LIST });
+```
+
+After the list is assigned to `globalThis`, the loader iterates over every symbol and spawns an isolated background worker for it:
+
+```typescript
+for (const symbol of SYMBOL_LIST) {
+  if (values.backtest) {
+    Backtest.background(symbol, {
+      exchangeName: exchangeSchema.exchangeName,
+      strategyName: strategySchema.strategyName,
+      frameName: frameSchema.frameName,
+    });
+  }
+  if (values.live || values.paper) {
+    Live.background(symbol, {
+      exchangeName: exchangeSchema.exchangeName,
+      strategyName: strategySchema.strategyName,
+    });
+  }
+}
+```
+
+Each `Backtest.background` (or `Live.background`) call creates a fully independent strategy instance. The strategy receives its own `symbol` parameter and uses it to filter Telegram posts — only posts that mention that ticker are forwarded to the LLM. This means the LLM cache key is `SYMBOL_timestamp`, and each symbol's results are isolated in the dump files.
+
+## addFrameSchema
+
+`addFrameSchema` in `modules/backtest.module.ts` defines the time window replayed during a backtest run. The shipped example covers August 2026:
+
+```typescript
+// modules/backtest.module.ts
+addFrameSchema({
+  frameName: "aug_2026_frame",
+  interval: "1m",
+  startDate: new Date("2026-08-01T00:00:00Z"),
+  endDate: new Date("2026-08-31T23:59:59Z"),
+  note: "August 2026",
+});
+```
+
+| Field | Type | Purpose |
+|---|---|---|
+| `frameName` | `string` | Unique identifier embedded in every dump event's `frameName` field |
+| `interval` | `"1m"` | Candle resolution — always `"1m"` for this rig |
+| `startDate` | `Date` | First candle timestamp (inclusive) |
+| `endDate` | `Date` | Last candle timestamp (inclusive) |
+| `note` | `string` | Human-readable label in reports |
+
+## Changing the backtest period
+
+To move the backtest window to a different month or quarter, update `startDate` and `endDate` in `modules/backtest.module.ts` and give the frame a new `frameName` so reports are self-documenting:
+
+```typescript
+addFrameSchema({
+  frameName: "q1_2027_frame",
+  interval: "1m",
+  startDate: new Date("2027-01-01T00:00:00Z"),
+  endDate: new Date("2027-03-31T23:59:59Z"),
+  note: "Q1 2027",
+});
+```
+
+After changing the dates, pre-warm the candle cache for the new period before running the backtest.
+
+## Pre-warming candles with `--cache`
+
+The `--cache` flag downloads 1-minute OHLCV data for every symbol in `SYMBOL_LIST` between `frameSchema.startDate` and `frameSchema.endDate`, and stores the candles in the `candle-items` MongoDB collection. It must be used together with `--backtest`:
+
+```bash
+npm start -- --backtest --cache --entry ./content/crypto_yoda_channel/main.strategy.ts
+```
+
+The loader executes the cache download before spawning any per-symbol backgrounds, so by the time replay begins every candle is already on disk and no live exchange calls are needed during the run.
+
+```typescript
+// config/loader.config.ts — CACHE_CANDLES_FN
+const CACHE_CANDLES_FN = async () => {
+  const [exchangeSchema] = await listExchangeSchema();
+  const [frameSchema] = await listFrameSchema();
+  for (const symbol of SYMBOL_LIST) {
+    await cacheCandles({
+      exchangeName: exchangeSchema.exchangeName,
+      from: frameSchema.startDate,
+      to: frameSchema.endDate,
+      interval: "1m",
+      symbol,
+    });
+  }
+};
+```
+
+## Walk-forward validation
+
+Any threshold or constant that survives one backtest month is a fitting candidate, not a proven edge. To validate, extend `startDate`/`endDate` to cover 4–6 months and use `Sweep` (parameter grid) and `Walker` (rolling optimization + out-of-sample check) from `backtest-kit`. Pre-warm the extended period first with `--cache`, then run `Sweep` over the candidate values. A constant that fails `Walker` at the out-of-sample step should be discarded or made structural.
+
+<Tip>
+  Always give the frame a descriptive name — for example `aug_2026_frame` or `q1_2027_frame` — rather than a generic `main_frame`. The `frameName` is embedded in every event written to `dump/report/backtest.jsonl`, so self-documenting names make it immediately clear which period produced a given result when you are reading reports weeks later.
+</Tip>

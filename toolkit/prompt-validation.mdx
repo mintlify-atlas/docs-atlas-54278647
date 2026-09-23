@@ -1,0 +1,175 @@
+---
+title: "Prompt regression testing with validate.mjs"
+sidebarTitle: "Prompt Validation"
+description: "Run and extend the prompt regression suite to catch silent regressions in LLM parsing before they reach production."
+---
+
+The LLM prompt is the most fragile part of any channel strategy. A single word change in `prompt.mustache` can shift how the model handles edge-case posts — result reports that should produce `wait`, multi-post windows where the signal post isn't last, vision posts where color means profit not direction. `validate.mjs` is the defence against those regressions: it runs the strategy's exact pipeline on a fixed set of real post IDs, checks every field of the model's output against known-correct expectations, and exits with code 1 if anything fails.
+
+## When to run
+
+Run `validate.mjs` after any of the following:
+
+- Any edit to `prompt.mustache` (or `prompt_open.mustache` / `prompt_close.mustache` for channels with two pipelines)
+- Any change to the LLM schema (`FormatModel` / `PositionOpenFormat` / `PositionCloseFormat`)
+- Before committing a new channel for the first time
+- When post IDs in the existing test cases have gone stale because the channel has moved far forward
+
+Always run from the channel folder — `session.txt` and the mustache templates must be in the current working directory:
+
+```bash
+cd content/crypto_yoda_channel
+node assets/validate.mjs
+
+# or for vershinin_trader
+cd content/vershinin_trader
+node assets/validate.mjs
+```
+
+## What mandatory cases must cover
+
+A complete test suite has one case for every distinct type of post the channel produces:
+
+- **Every signal format** — if the channel posts both text signals and image-only signals (as `vershinin_trader` does), both must be covered
+- **Every asset class** — if the channel posts signals for multiple tickers, include cases that verify the model correctly identifies the symbol and ignores signals for other symbols
+- **Every non-signal type** — result reports (`"Тейк-профит 2 ✅"` posts), ads, analytics posts, channel management messages: all must produce `wait` or `hold`, not a spurious entry
+- **Multi-post windows** — when the strategy passes several posts to the model at once, test cases where the signal is not the last post in the window (this is the category of failure that validate was designed to catch — see below)
+
+## The validate.mjs structure
+
+Here is the complete `vershinin_trader` validate script, which covers both the `open` and `close` pipelines, including vision cases:
+
+```javascript
+import { scrapePage } from "telegram-reader";
+import { generateObject, InferenceName } from "json-inference";
+import { str, memoize } from "functools-kit";
+import { readFile } from "fs/promises";
+import Mustache from "mustache";
+
+const CHANNEL_NAME = "-1002833393903";
+
+const PositionOpenFormat = {
+  type: "object",
+  required: ["id", "symbol", "position", "reasoning"],
+  properties: {
+    id: { type: "number", description: str.newline("ID сообщения из которого был сформирован сигнал.", "Это число, пиши только его без строгового префикса ID, например, 2134.", "Если сигнала нет, верни -1") },
+    symbol: { type: "string", description: str.newline("Тикер позиции строго в формате *USDT, Например", "Текст #BTC/USDT преобразуем в BTCUSDT без # и /") },
+    position: { type: "string", enum: ["long", "short", "wait"], description: "Тип позиции, long или short. Если позиции нет, верни wait" },
+    reasoning: { type: "string", description: str.newline("Строковое описание почему ты сделал именно такое решение", "Будет использовано программистом для отладки") },
+  },
+};
+
+const PositionCloseFormat = {
+  type: "object",
+  required: ["id", "symbol", "action", "reasoning"],
+  properties: {
+    id: { type: "number", description: str.newline("ID сообщения из которого был сформировано действие.", "Это число, пиши только его без строгового префикса ID, например, 2134.", "Если сигнала нет, верни -1") },
+    symbol: { type: "string", description: str.newline("Тикер позиции строго в формате *USDT, Например", "Текст #BTC/USDT преобразуем в BTCUSDT без # и /") },
+    action: { type: "string", enum: ["hold", "close"], description: str.newline("Тип действия, hold или close. Если трейдер", "закрыл позицию, в том числе все позиции разом", "то выбери close. Иначе hold") },
+    reasoning: { type: "string", description: str.newline("Строковое описание почему ты сделал именно такое решение", "Будет использовано программистом для отладки") },
+  },
+};
+
+const getPrompt = memoize(
+  ([symbol, name]) => `${symbol}-${name}`,
+  async (symbol, name) => Mustache.render(await readFile(`./${name}.mustache`, "utf-8"), { symbol }),
+);
+
+const all = await scrapePage({
+  channel: CHANNEL_NAME,
+  limit: 60,
+  offset: 0,
+  when: new Date("2027-01-01T00:00:00Z"),
+});
+const byId = Object.fromEntries(all.map((m) => [m.id, m]));
+
+const toLlmMessages = (posts) =>
+  posts.map(({ id, channel, date, content, photo }) => ({
+    role: "user",
+    content: str.newline(`ID ${id}`, "", content, "", `[${date.toISOString()}]: https://t.me/c/${channel.slice(4)}/${id}`),
+    ...(photo && { images: [photo] }),
+  }));
+
+let failed = 0;
+
+const run = async (kind, symbol, ids, expect) => {
+  const posts = ids.map((id) => byId[id]).filter(Boolean);
+  if (posts.length !== ids.length) {
+    console.log(`SKIP ${kind}/${symbol}: posts ${ids} not all found (channel moved forward — pick fresh IDs)`);
+    return;
+  }
+  const format = kind === "open" ? PositionOpenFormat : PositionCloseFormat;
+  const prompt = await getPrompt(symbol, kind === "open" ? "prompt_open" : "prompt_close");
+  const result = await generateObject(
+    InferenceName.OllamaInference,
+    { format, messages: [{ role: "user", content: prompt }, ...toLlmMessages(posts)] },
+    "gemma4:31b-cloud",
+  );
+  const got = kind === "open" ? result.position : result.action;
+  const ok = got === expect.verdict && (expect.id === undefined || result.id === expect.id);
+  if (!ok) failed++;
+  console.log(`${ok ? "PASS" : "FAIL"} ${kind}/${symbol} posts=[${ids}] -> ${got} id=${result.id} (expected ${expect.verdict}${expect.id !== undefined ? " id=" + expect.id : ""})`);
+  if (!ok) console.log("  reasoning:", result.reasoning);
+};
+
+// open: full text signal for ETH among ads and a different-symbol post
+await run("open", "ETHUSDT", [3576, 3548, 3550], { verdict: "long", id: 3548 });
+// open: no BTC signal in this window -> wait
+await run("open", "BTCUSDT", [3576, 3548, 3550], { verdict: "wait" });
+// open: SOL long from current levels
+await run("open", "SOLUSDT", [3576, 3548, 3550], { verdict: "long", id: 3550 });
+// open (vision): direction only from TradingView chart
+await run("open", "ETHUSDT", [3572], { verdict: "long", id: 3572 });
+await run("open", "BTCUSDT", [3573], { verdict: "long", id: 3573 });
+// open (vision): BYDFi card long VIRTUAL, asking a different symbol -> wait
+await run("open", "BTCUSDT", [3558], { verdict: "wait" });
+// close: stop move -> hold
+await run("close", "ETHUSDT", [3557], { verdict: "hold" });
+// close: partial take -> hold
+await run("close", "ETHUSDT", [3569], { verdict: "hold" });
+// close: "closing my shorts" -> close
+await run("close", "BTCUSDT", [3564], { verdict: "close", id: 3564 });
+// close: analytics -> hold
+await run("close", "BTCUSDT", [3537], { verdict: "hold" });
+
+console.log(failed ? `\n${failed} FAIL` : "\nALL PASS");
+process.exit(failed ? 1 : 0);
+```
+
+## The exact pipeline — no shortcuts
+
+The critical requirement is that validate uses exactly the same pipeline as the strategy itself: the same `scrapePage` call, the same Mustache render, the same `generateObject` call, and the same message assembly format including `ID`, date, URL, and the `images` field for photo posts. A simplified test that omits any of these may pass while the real strategy fails.
+
+In particular, the `content` field of each message must include the `ID <n>` prefix, the post text, and the URL line in the same format the prompt was written to expect:
+
+```javascript
+content: str.newline(`ID ${id}`, "", content, "", `[${date.toISOString()}]: https://t.me/${channel}/${id}`)
+```
+
+For private channels the URL format differs — `https://t.me/c/${channel.slice(4)}/${id}` — and that difference must match exactly between validate and the production strategy.
+
+## A real failure caught by validate
+
+The following failure was caught during development of `crypto_yoda_channel` and is documented in CLAUDE.md:
+
+**Symptom:** When the strategy passed a multi-post window to the model (the current 5-minute lookback often contains several posts), the model consistently anchored on the *last* post in the window rather than scanning all of them. A PENGU short signal in post 5885 was missed when post 5885 was not the final message in the window.
+
+**Root cause:** The prompt did not explicitly instruct the model to read all messages. With multiple `user` turns in the conversation, the model treated the last one as the relevant input.
+
+**Fix:** Added an explicit rule to `prompt.mustache`: scan ALL messages; return `wait` only if none of them contain an entry for `{{symbol}}`.
+
+**How validate caught it:** The test case `run("PENGUUSDT", [5885], { position: "short", id: 5885 })` passed in isolation, but a test with `[5885, <later_post>]` where the later post was not a PENGU signal failed — exactly the multi-post case the production strategy encounters on every tick.
+
+## Updating stale post IDs
+
+Post IDs become unreachable once the channel has moved far enough forward that `scrapePage` with a reasonable `limit` no longer returns them. When validate prints `SKIP` for a case, find a replacement post of the same type using `read-posts.mjs`:
+
+```bash
+node assets/read-posts.mjs 100
+```
+
+Read through the output, find a post of the same category (signal of the same type, or the same non-signal type), note its ID, and update the corresponding `run(...)` call in `validate.mjs`. Update the expected fields (`id`, `position`, `entryFrom`, etc.) to match the new post.
+
+<Warning>
+If `validate.mjs` passes but the production strategy produces unexpected results, verify that the test uses exactly the same message assembly as the real strategy — including the `ID`/date/URL formatting and the `images` field for photo posts. A test that omits `images` will pass even if the vision path is broken. The `toLlmMessages` function in the validate script must be a copy of the same function used in the strategy, not a simplified version.
+</Warning>

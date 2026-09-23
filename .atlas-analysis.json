@@ -1,0 +1,99 @@
+{
+  "projectType": "ai-ml",
+  "projectName": "Backtest Ollama Casual",
+  "projectDescription": "A measurement rig for Telegram signal channels that uses an Ollama LLM to parse trader guidance (text and chart screenshots), executes trades via backtest-kit within minutes of publication, and runs event studies to reveal where the edge actually lives.",
+  "theme": "luma",
+  "primaryColor": "#1f70c2",
+  "lightColor": null,
+  "darkColor": null,
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/architecture",
+              "concepts/llm-parsing",
+              "concepts/backtest-engine",
+              "concepts/event-study"
+            ]
+          },
+          {
+            "group": "Channels",
+            "pages": [
+              "channels/crypto-yoda",
+              "channels/vershinin-trader",
+              "channels/adding-a-channel"
+            ]
+          },
+          {
+            "group": "Configuration & Operations",
+            "pages": [
+              "config/symbols-and-frame",
+              "config/modules",
+              "config/docker",
+              "config/dump-format"
+            ]
+          },
+          {
+            "group": "Forensics Toolkit",
+            "pages": [
+              "toolkit/scripts-overview",
+              "toolkit/mongodb-queries",
+              "toolkit/prompt-validation",
+              "toolkit/thresholds"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "LLM-driven Telegram signal parsing (text + chart screenshots) via json-inference tool-grammar",
+    "Zero look-ahead bias backtesting over 1-minute OHLCV candles with backtest-kit",
+    "Level-ratchet trailing stop derived from signal grid geometry, not fitted to PnL",
+    "Dual-pipeline event-driven strategy for channels where entry and exit are separate posts",
+    "Event study toolkit measuring directional edge at +15m/+1h/+4h/+12h/+24h horizons",
+    "Prompt regression suite (validate.mjs) that exits non-zero on any parsing failure",
+    "Deterministic numeric extraction via Ollama tool-call grammar despite non-deterministic reasoning",
+    "Vision support — base64 JPEG post images sent directly to the model for chart/position-card reading"
+  ],
+  "publicApiSurface": [
+    "npm start -- --backtest --ui --entry <strategy.ts>",
+    "npm start -- --backtest --ui --entry <strategy.ts> --cache",
+    "npm start -- --live --ui --entry <strategy.ts>",
+    "npm start -- --paper --ui --entry <strategy.ts>",
+    "node -e 'require(\"telegram-reader\").signIn()'",
+    "node assets/event-study.mjs <bucket>",
+    "node assets/read-cache.mjs",
+    "node assets/read-posts.mjs",
+    "node assets/validate.mjs",
+    "node assets/download-photos.mjs",
+    "Cache.file(fn, { interval, name })",
+    "addStrategySchema({ strategyName, getSignal? })",
+    "addExchangeSchema({ exchangeName, getCandles, ... })",
+    "addFrameSchema({ frameName, interval, startDate, endDate })",
+    "listenIdlePing(callback)",
+    "listenActivePing(callback)",
+    "commitCreateSignal(symbol, dto)",
+    "commitClosePending(symbol, opts?)",
+    "commitBreakeven(symbol)",
+    "commitSignalNotify(symbol, opts)",
+    "Position.moonbag({ position, currentPrice, percentStopLoss })",
+    "Position.bracket({ position, currentPrice, priceTakeProfit, priceStopLoss })",
+    "State({ initialData, name })",
+    "generateObject(InferenceName.OllamaInference, { format, messages }, model)",
+    "scrapeLookback({ channel, limit, dimension, when })",
+    "scrapePage({ channel, limit, offset, when })",
+    "scrapeDay({ channel, date })"
+  ]
+}
